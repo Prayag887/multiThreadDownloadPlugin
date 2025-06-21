@@ -1,0 +1,31 @@
+name: multithread_downloads_example
+description: "Demonstrates how to use the multithread_downloads plugin."
+# The following line prevents the package from being accidentally published to
+# pub.dev using `flutter pub publish`. This is preferred for private packages.
+publish_to: 'none' # Remove this line if you wish to publish to pub.dev
+
+environment:
+  sdk: ^3.6.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  multithread_downloads:
+    path: ../
+
+  cupertino_icons: ^1.0.8
+
+  path_provider: ^2.0.15  # Add this dependency
+  permission_handler: ^10.4.3  # For storage permissions
+
+dev_dependencies:
+  integration_test:
+    sdk: flutter
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+
