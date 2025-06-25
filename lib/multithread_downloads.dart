@@ -1,4 +1,3 @@
-// lib/multithread_downloads.dart
 import 'dart:async';
 import 'dart:io';
 import 'package:flutter/services.dart';
@@ -97,14 +96,14 @@ class MultithreadedDownloads {
 }
 
 class DownloadProgress {
-  final String url;
-  final String filePath;
-  final int progress;
-  final int bytesDownloaded;
-  final int totalBytes;
-  final DownloadStatus status;
-  final String? error;
-  final double speed; // bytes per second
+   String url;
+   String filePath;
+   int progress;
+   int bytesDownloaded;
+   int totalBytes;
+  DownloadStatus status;
+   String? error;
+   double speed;
 
   DownloadProgress({
     required this.url,

@@ -19,7 +19,6 @@ void main() {
   );
 }
 
-
 class MyApp extends StatefulWidget {
   const MyApp({super.key});
 
@@ -31,6 +30,9 @@ class _MyAppState extends State<MyApp> {
   List<DownloadProgress> downloads = [];
   final String _downloadUrl = 'https://nbg1-speed.hetzner.com//1GB.bin';
   final TextEditingController _urlController = TextEditingController();
+
+  // Track button states to prevent multiple taps
+  Map<String, bool> _buttonStates = {};
 
   @override
   void initState() {
@@ -45,6 +47,15 @@ class _MyAppState extends State<MyApp> {
           downloads[index] = progress;
         } else {
           downloads.add(progress);
+        }
+
+        // Reset button state when status changes to expected states
+        if (progress.status == DownloadStatus.paused ||
+            progress.status == DownloadStatus.downloading ||
+            progress.status == DownloadStatus.cancelled ||
+            progress.status == DownloadStatus.completed ||
+            progress.status == DownloadStatus.failed) {
+          _buttonStates[progress.url] = false;
         }
       });
     });
@@ -96,8 +107,8 @@ class _MyAppState extends State<MyApp> {
       final success = await MultithreadedDownloads.startDownload(
         url: url,
         filePath: filePath,
-        maxConcurrentTasks: 4, // for multi-threads
-        chunkSize: 1024 * 1024, // 1MB chunks
+        maxConcurrentTasks: 4,
+        chunkSize: 1024 * 1024,
         retryCount: 3,
         timeoutSeconds: 30,
         headers: {
@@ -134,6 +145,93 @@ class _MyAppState extends State<MyApp> {
     }
   }
 
+  Future<void> _pauseDownload(DownloadProgress download, String url) async {
+    if (_buttonStates[url] == true) return; // Prevent multiple taps
+    download.status = DownloadStatus.paused;
+    setState(() {
+      _buttonStates[url] = true;
+    });
+
+    try {
+      final success = await MultithreadedDownloads.pauseDownload(url);
+      if (success) {
+        _showSnackBar('Download paused');
+        // Reset button state immediately for pause since it should be instant
+        setState(() {
+          _buttonStates[url] = false;
+        });
+      } else {
+        _showSnackBar('Failed to pause download');
+        setState(() {
+          _buttonStates[url] = false;
+        });
+      }
+    } catch (e) {
+      _showSnackBar('Error pausing download: ${e.toString()}');
+      setState(() {
+        _buttonStates[url] = false;
+      });
+    }
+  }
+
+  Future<void> _resumeDownload(String url) async {
+    if (_buttonStates[url] == true) return; // Prevent multiple taps
+
+    setState(() {
+      _buttonStates[url] = true;
+    });
+
+    try {
+      final success = await MultithreadedDownloads.resumeDownload(url);
+      if (success) {
+        _showSnackBar('Download resumed');
+        // Reset button state immediately for resume since it should be instant
+        setState(() {
+          _buttonStates[url] = false;
+        });
+      } else {
+        _showSnackBar('Failed to resume download');
+        setState(() {
+          _buttonStates[url] = false;
+        });
+      }
+    } catch (e) {
+      _showSnackBar('Error resuming download: ${e.toString()}');
+      setState(() {
+        _buttonStates[url] = false;
+      });
+    }
+  }
+
+  Future<void> _cancelDownload(String url) async {
+    if (_buttonStates[url] == true) return; // Prevent multiple taps
+
+    setState(() {
+      _buttonStates[url] = true;
+    });
+
+    try {
+      final success = await MultithreadedDownloads.cancelDownload(url);
+      if (success) {
+        _showSnackBar('Download cancelled');
+        // Reset button state immediately for cancel since it should be instant
+        setState(() {
+          _buttonStates[url] = false;
+        });
+      } else {
+        _showSnackBar('Failed to cancel download');
+        setState(() {
+          _buttonStates[url] = false;
+        });
+      }
+    } catch (e) {
+      _showSnackBar('Error cancelling download: ${e.toString()}');
+      setState(() {
+        _buttonStates[url] = false;
+      });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -149,80 +247,81 @@ class _MyAppState extends State<MyApp> {
       ),
       body: Column(
         children: [
-            // URL Input Section
-            Container(
-              padding: EdgeInsets.all(16),
-              child: Column(
-                children: [
-                  TextField(
-                    controller: _urlController,
-                    decoration: InputDecoration(
-                      labelText: 'Download URL',
-                      hintText: 'Enter the URL to download',
-                      border: OutlineInputBorder(),
-                      suffixIcon: IconButton(
-                        icon: Icon(Icons.clear),
-                        onPressed: () => _urlController.clear(),
-                      ),
+          // URL Input Section
+          Container(
+            padding: EdgeInsets.all(16),
+            child: Column(
+              children: [
+                TextField(
+                  controller: _urlController,
+                  decoration: InputDecoration(
+                    labelText: 'Download URL',
+                    hintText: 'Enter the URL to download',
+                    border: OutlineInputBorder(),
+                    suffixIcon: IconButton(
+                      icon: Icon(Icons.clear),
+                      onPressed: () => _urlController.clear(),
                     ),
-                    maxLines: 2,
-                    minLines: 1,
                   ),
-                  SizedBox(height: 12),
-                  SizedBox(
-                    width: double.infinity,
-                    child: ElevatedButton.icon(
-                      onPressed: startDownload,
-                      icon: Icon(Icons.download),
-                      label: Text('Start Download'),
-                      style: ElevatedButton.styleFrom(
-                        padding: EdgeInsets.symmetric(vertical: 12),
-                      ),
+                  maxLines: 2,
+                  minLines: 1,
+                ),
+                SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton.icon(
+                    onPressed: startDownload,
+                    icon: Icon(Icons.download),
+                    label: Text('Start Download'),
+                    style: ElevatedButton.styleFrom(
+                      padding: EdgeInsets.symmetric(vertical: 12),
                     ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Divider(),
+
+          // Downloads List
+          Expanded(
+            child: downloads.isEmpty
+                ? Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(Icons.download, size: 64, color: Colors.grey),
+                  SizedBox(height: 16),
+                  Text(
+                    'No downloads yet',
+                    style: TextStyle(fontSize: 18, color: Colors.grey),
+                  ),
+                  SizedBox(height: 8),
+                  Text(
+                    'Enter a URL above and tap "Start Download"',
+                    style: TextStyle(color: Colors.grey),
                   ),
                 ],
               ),
+            )
+                : ListView.builder(
+              itemCount: downloads.length,
+              itemBuilder: (context, index) {
+                final download = downloads[index];
+                return _buildDownloadCard(download);
+              },
             ),
-            Divider(),
-
-            // Downloads List
-            Expanded(
-              child: downloads.isEmpty
-                  ? Center(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(Icons.download, size: 64, color: Colors.grey),
-                    SizedBox(height: 16),
-                    Text(
-                      'No downloads yet',
-                      style: TextStyle(fontSize: 18, color: Colors.grey),
-                    ),
-                    SizedBox(height: 8),
-                    Text(
-                      'Enter a URL above and tap "Start Download"',
-                      style: TextStyle(color: Colors.grey),
-                    ),
-                  ],
-                ),
-              )
-                  : ListView.builder(
-                itemCount: downloads.length,
-                itemBuilder: (context, index) {
-                  final download = downloads[index];
-                  return _buildDownloadCard(download);
-                },
-              ),
-            ),
-          ],
-        ),
+          ),
+        ],
+      ),
     );
   }
 
   Widget _buildDownloadCard(DownloadProgress download) {
-    if(download.error != null) {
-      log("Error: ${download.error}");
-    }
+    log("Status: ${download.status}, Progress: ${download.progress}, Error: ${download.error}");
+
+    final bool isButtonLoading = _buttonStates[download.url] ?? false;
+
     return Card(
       margin: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
       elevation: 4,
@@ -251,6 +350,38 @@ class _MyAppState extends State<MyApp> {
             ),
             SizedBox(height: 12),
 
+            // Status indicator with better visibility
+            Container(
+              padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: _getStatusColor(download.status).withOpacity(0.1),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: _getStatusColor(download.status).withOpacity(0.3),
+                ),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    _getStatusIcon(download.status),
+                    size: 16,
+                    color: _getStatusColor(download.status),
+                  ),
+                  SizedBox(width: 4),
+                  Text(
+                    _getStatusText(download.status),
+                    style: TextStyle(
+                      color: _getStatusColor(download.status),
+                      fontWeight: FontWeight.w600,
+                      fontSize: 12,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            SizedBox(height: 12),
+
             // Progress bar
             LinearProgressIndicator(
               value: download.progress / 100.0,
@@ -265,26 +396,27 @@ class _MyAppState extends State<MyApp> {
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Text('${download.progress}%'),
-                Text(_getStatusText(download.status)),
+                Text(
+                  '${download.progress.toStringAsFixed(1)}%',
+                  style: TextStyle(fontWeight: FontWeight.w500),
+                ),
+                if (download.status == DownloadStatus.downloading && download.speed > 0)
+                  Text(
+                    '${_formatBytes(download.speed.toInt())}/s',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Colors.blue,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
               ],
             ),
             SizedBox(height: 8),
 
             // Download info
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text(
-                  '${_formatBytes(download.bytesDownloaded)} / ${_formatBytes(download.totalBytes)}',
-                  style: TextStyle(fontSize: 12),
-                ),
-                if (download.speed > 0)
-                  Text(
-                    '${_formatBytes(download.speed.toInt())}/s',
-                    style: TextStyle(fontSize: 12, color: Colors.blue),
-                  ),
-              ],
+            Text(
+              '${_formatBytes(download.bytesDownloaded)} / ${_formatBytes(download.totalBytes)}',
+              style: TextStyle(fontSize: 12, color: Colors.grey[600]),
             ),
 
             // Error message
@@ -314,51 +446,82 @@ class _MyAppState extends State<MyApp> {
 
             SizedBox(height: 12),
 
-            // Action buttons
-            Row(
+            // Action buttons with improved UI
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
               children: [
                 if (download.status == DownloadStatus.downloading) ...[
                   ElevatedButton.icon(
-                    onPressed: () => MultithreadedDownloads.pauseDownload(download.url),
-                    icon: Icon(Icons.pause, size: 16),
-                    label: Text('Pause'),
+                    onPressed: isButtonLoading ? null : () => _pauseDownload(download, download.url),
+                    icon: isButtonLoading
+                        ? SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                        : Icon(Icons.pause, size: 16),
+                    label: Text(isButtonLoading ? 'Pausing...' : 'Pause'),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: Colors.orange,
                       foregroundColor: Colors.white,
+                      padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                     ),
                   ),
                 ] else if (download.status == DownloadStatus.paused) ...[
                   ElevatedButton.icon(
-                    onPressed: () => MultithreadedDownloads.resumeDownload(download.url),
-                    icon: Icon(Icons.play_arrow, size: 16),
-                    label: Text('Resume'),
+                    onPressed: isButtonLoading ? null : () => _resumeDownload(download.url),
+                    icon: isButtonLoading
+                        ? SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                        : Icon(Icons.play_arrow, size: 16),
+                    label: Text(isButtonLoading ? 'Resuming...' : 'Resume'),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: Colors.green,
                       foregroundColor: Colors.white,
+                      padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                     ),
                   ),
                 ] else if (download.status == DownloadStatus.failed) ...[
                   ElevatedButton.icon(
-                    onPressed: () => MultithreadedDownloads.resumeDownload(download.url),
-                    icon: Icon(Icons.refresh, size: 16),
-                    label: Text('Retry'),
+                    onPressed: isButtonLoading ? null : () => _resumeDownload(download.url),
+                    icon: isButtonLoading
+                        ? SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                        : Icon(Icons.refresh, size: 16),
+                    label: Text(isButtonLoading ? 'Retrying...' : 'Retry'),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: Colors.blue,
                       foregroundColor: Colors.white,
+                      padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                     ),
                   ),
                 ],
 
-                SizedBox(width: 8),
-
                 if (download.status != DownloadStatus.completed) ...[
                   OutlinedButton.icon(
-                    onPressed: () => MultithreadedDownloads.cancelDownload(download.url),
-                    icon: Icon(Icons.cancel, size: 16),
-                    label: Text('Cancel'),
+                    onPressed: isButtonLoading ? null : () => _cancelDownload(download.url),
+                    icon: isButtonLoading
+                        ? SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        valueColor: AlwaysStoppedAnimation<Color>(Colors.red),
+                      ),
+                    )
+                        : Icon(Icons.cancel, size: 16),
+                    label: Text(isButtonLoading ? 'Cancelling...' : 'Cancel'),
                     style: OutlinedButton.styleFrom(
                       foregroundColor: Colors.red,
                       side: BorderSide(color: Colors.red),
+                      padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                     ),
                   ),
                 ],
@@ -371,6 +534,7 @@ class _MyAppState extends State<MyApp> {
                     style: ElevatedButton.styleFrom(
                       backgroundColor: Colors.green,
                       foregroundColor: Colors.white,
+                      padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                     ),
                   ),
                 ],
@@ -400,6 +564,23 @@ class _MyAppState extends State<MyApp> {
         return 'Failed';
       case DownloadStatus.cancelled:
         return 'Cancelled';
+    }
+  }
+
+  IconData _getStatusIcon(DownloadStatus status) {
+    switch (status) {
+      case DownloadStatus.pending:
+        return Icons.schedule;
+      case DownloadStatus.downloading:
+        return Icons.download;
+      case DownloadStatus.paused:
+        return Icons.pause_circle_filled;
+      case DownloadStatus.completed:
+        return Icons.check_circle;
+      case DownloadStatus.failed:
+        return Icons.error;
+      case DownloadStatus.cancelled:
+        return Icons.cancel;
     }
   }
 
