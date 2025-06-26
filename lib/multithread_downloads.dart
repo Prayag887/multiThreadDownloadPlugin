@@ -1,12 +1,54 @@
 import 'dart:async';
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:shelf/shelf.dart';
+import 'package:shelf/shelf_io.dart' as io;
+import 'package:shelf_static/shelf_static.dart';
 
 class MultithreadedDownloads {
   static const MethodChannel _channel = MethodChannel('multithread_downloads');
   static const EventChannel _progressChannel = EventChannel('multithread_downloads/progress');
 
   static Stream<DownloadProgress>? _progressStream;
+
+  // Keep a reference to your server so you can close it if needed
+  HttpServer? _localServer;
+
+  Future<void> startLocalHttpServer(String directoryPath, int port) async {
+    final dir = Directory(directoryPath);
+
+    // Validate directory
+    if (!await dir.exists()) {
+      throw Exception('Directory does not exist: $directoryPath');
+    }
+
+    // List files for debugging
+    print('Files in directory:');
+    await for (var entity in dir.list()) {
+      print('  ${entity.path}');
+    }
+
+    var handler = createStaticHandler(
+      directoryPath,
+      serveFilesOutsidePath: true,
+      listDirectories: true,
+    );
+
+    // Add middleware for logging
+    var loggedHandler = Pipeline()
+        .addMiddleware(logRequests())
+        .addHandler(handler);
+
+    _localServer = await io.serve(loggedHandler, 'localhost', port);
+    print('Server started at http://localhost:$port');
+    print('Serving: ${dir.absolute.path}');
+  }
+
+  Future<void> stopLocalHttpServer() async {
+    await _localServer?.close(force: true);
+    _localServer = null;
+  }
 
   static Stream<DownloadProgress> get progressStream {
     _progressStream ??= _progressChannel
@@ -18,6 +60,7 @@ class MultithreadedDownloads {
   static Future<bool> startDownload({
     required List<String> urls,
     required String filePath,
+    String fileName = '',
     Map<String, String>? headers,
     int maxConcurrentTasks = 4,
     int retryCount = 3,
@@ -26,6 +69,7 @@ class MultithreadedDownloads {
     try {
       final result = await _channel.invokeMethod('startDownload', {
         'urls': urls,
+        'fileName': fileName,
         'filePath': filePath,
         'headers': headers ?? {},
         'maxConcurrentTasks': maxConcurrentTasks,

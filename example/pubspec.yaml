@@ -19,6 +19,11 @@ dependencies:
   path_provider: ^2.0.15
   permission_handler: ^11.3.0
 
+  better_player:
+    git:
+      url: https://github.com/anjalmaharjan/better_player_latest.git
+      ref: fix/ios-speed
+
 dev_dependencies:
   integration_test:
     sdk: flutter
