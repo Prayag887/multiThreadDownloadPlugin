@@ -4,14 +4,16 @@ import 'package:flutter/services.dart';
 
 class MultithreadedDownloads {
   static const MethodChannel _channel = MethodChannel('multithread_downloads');
-  static const EventChannel _progressChannel = EventChannel('multithread_downloads/progress');
+  static const EventChannel _progressChannel = EventChannel(
+      'multithread_downloads/progress');
 
   static Stream<DownloadProgress>? _progressStream;
 
   static Stream<DownloadProgress> get progressStream {
     _progressStream ??= _progressChannel
         .receiveBroadcastStream()
-        .map((event) => DownloadProgress.fromMap(Map<String, dynamic>.from(event)));
+        .map((event) =>
+        DownloadProgress.fromMap(Map<String, dynamic>.from(event)));
     return _progressStream!;
   }
 
@@ -51,7 +53,8 @@ class MultithreadedDownloads {
 
   static Future<bool> resumeDownload(String url) async {
     try {
-      final result = await _channel.invokeMethod('resumeDownload', {'url': url});
+      final result = await _channel.invokeMethod(
+          'resumeDownload', {'url': url});
       return result == true;
     } catch (e) {
       return false;
@@ -60,7 +63,8 @@ class MultithreadedDownloads {
 
   static Future<bool> cancelDownload(String url) async {
     try {
-      final result = await _channel.invokeMethod('cancelDownload', {'url': url});
+      final result = await _channel.invokeMethod(
+          'cancelDownload', {'url': url});
       return result == true;
     } catch (e) {
       return false;
@@ -97,7 +101,8 @@ class MultithreadedDownloads {
 
   static Future<bool> pauseDownloads(List<String> urls) async {
     try {
-      final result = await _channel.invokeMethod('pauseDownloads', {'urls': urls});
+      final result = await _channel.invokeMethod(
+          'pauseDownloads', {'urls': urls});
       return result == true;
     } catch (e) {
       return false;
@@ -106,7 +111,8 @@ class MultithreadedDownloads {
 
   static Future<bool> resumeDownloads(List<String> urls) async {
     try {
-      final result = await _channel.invokeMethod('resumeDownloads', {'urls': urls});
+      final result = await _channel.invokeMethod(
+          'resumeDownloads', {'urls': urls});
       return result == true;
     } catch (e) {
       return false;
@@ -115,7 +121,8 @@ class MultithreadedDownloads {
 
   static Future<bool> cancelDownloads(List<String> urls) async {
     try {
-      final result = await _channel.invokeMethod('cancelDownloads', {'urls': urls});
+      final result = await _channel.invokeMethod(
+          'cancelDownloads', {'urls': urls});
       return result == true;
     } catch (e) {
       return false;
@@ -124,16 +131,19 @@ class MultithreadedDownloads {
 
   static Future<Map<String, dynamic>?> getDownloadStatus(String url) async {
     try {
-      final result = await _channel.invokeMethod('getDownloadStatus', {'url': url});
+      final result = await _channel.invokeMethod(
+          'getDownloadStatus', {'url': url});
       return Map<String, dynamic>.from(result);
     } catch (e) {
       return null;
     }
   }
 
-  static Future<List<Map<String, dynamic>>> getDownloadStatuses(List<String> urls) async {
+  static Future<List<Map<String, dynamic>>> getDownloadStatuses(
+      List<String> urls) async {
     try {
-      final result = await _channel.invokeMethod('getDownloadStatuses', {'urls': urls});
+      final result = await _channel.invokeMethod(
+          'getDownloadStatuses', {'urls': urls});
       return List<Map<String, dynamic>>.from(result);
     } catch (e) {
       return [];
@@ -195,7 +205,8 @@ class MultithreadedDownloads {
   /// Pause an M3U8 download
   static Future<bool> pauseM3u8Download(String url) async {
     try {
-      final result = await _channel.invokeMethod('pauseM3u8Download', {'url': url});
+      final result = await _channel.invokeMethod(
+          'pauseM3u8Download', {'url': url});
       return result == true;
     } catch (e) {
       return false;
@@ -205,7 +216,8 @@ class MultithreadedDownloads {
   /// Resume a paused M3U8 download
   static Future<bool> resumeM3u8Download(String url) async {
     try {
-      final result = await _channel.invokeMethod('resumeM3u8Download', {'url': url});
+      final result = await _channel.invokeMethod(
+          'resumeM3u8Download', {'url': url});
       return result == true;
     } catch (e) {
       return false;
@@ -215,7 +227,8 @@ class MultithreadedDownloads {
   /// Cancel an M3U8 download
   static Future<bool> cancelM3u8Download(String url) async {
     try {
-      final result = await _channel.invokeMethod('cancelM3u8Download', {'url': url});
+      final result = await _channel.invokeMethod(
+          'cancelM3u8Download', {'url': url});
       return result == true;
     } catch (e) {
       return false;
@@ -225,7 +238,8 @@ class MultithreadedDownloads {
   /// Get the status of a specific M3U8 download
   static Future<Map<String, dynamic>?> getM3u8DownloadStatus(String url) async {
     try {
-      final result = await _channel.invokeMethod('getM3u8DownloadStatus', {'url': url});
+      final result = await _channel.invokeMethod(
+          'getM3u8DownloadStatus', {'url': url});
       return result != null ? Map<String, dynamic>.from(result) : null;
     } catch (e) {
       return null;
@@ -256,72 +270,8 @@ class MultithreadedDownloads {
 
   /// Check if a URL is an M3U8 playlist
   static bool isM3u8Url(String url) {
-    return url.toLowerCase().contains('.m3u8') || url.toLowerCase().contains('m3u8');
-  }
-
-  /// Start download with automatic detection of file type
-  /// Will use M3U8 downloader for .m3u8 URLs, regular downloader for others
-  static Future<bool> startSmartDownload({
-    required String url,
-    required String filePath,
-    Map<String, String>? headers,
-    // Regular download parameters (ignored for M3U8)
-    int maxConcurrentTasks = 4,
-    int retryCount = 3,
-    int timeoutSeconds = 30,
-  }) async {
-    if (isM3u8Url(url)) {
-      return startM3u8Download(
-        url: url,
-        filePath: filePath,
-        headers: headers,
-      );
-    } else {
-      return startDownload(
-        urls: [url],
-        filePath: filePath,
-        headers: headers,
-        maxConcurrentTasks: maxConcurrentTasks,
-        retryCount: retryCount,
-        timeoutSeconds: timeoutSeconds,
-      );
-    }
-  }
-
-  /// Pause download with automatic detection of file type
-  static Future<bool> pauseSmartDownload(String url) async {
-    if (isM3u8Url(url)) {
-      return pauseM3u8Download(url);
-    } else {
-      return pauseDownload(url);
-    }
-  }
-
-  /// Resume download with automatic detection of file type
-  static Future<bool> resumeSmartDownload(String url) async {
-    if (isM3u8Url(url)) {
-      return resumeM3u8Download(url);
-    } else {
-      return resumeDownload(url);
-    }
-  }
-
-  /// Cancel download with automatic detection of file type
-  static Future<bool> cancelSmartDownload(String url) async {
-    if (isM3u8Url(url)) {
-      return cancelM3u8Download(url);
-    } else {
-      return cancelDownload(url);
-    }
-  }
-
-  /// Get download status with automatic detection of file type
-  static Future<Map<String, dynamic>?> getSmartDownloadStatus(String url) async {
-    if (isM3u8Url(url)) {
-      return getM3u8DownloadStatus(url);
-    } else {
-      return getDownloadStatus(url);
-    }
+    return url.toLowerCase().contains('.m3u8') ||
+        url.toLowerCase().contains('m3u8');
   }
 }
 
@@ -345,7 +295,7 @@ class DownloadProgress {
     required this.status,
     this.error,
     required this.speed,
-    this.type = DownloadType.regular,
+    this.type = DownloadType.http_batch,
   });
 
   factory DownloadProgress.fromMap(Map<String, dynamic> map) {
@@ -355,16 +305,26 @@ class DownloadProgress {
       progress: map['progress'] ?? 0,
       bytesDownloaded: map['bytesDownloaded'] ?? 0,
       totalBytes: map['totalBytes'] ?? 0,
-      status: DownloadStatus.values[map['status'] ?? 0],
+
+      // Safe enum parsing for `DownloadStatus`
+      status: map['status'] is String
+          ? DownloadStatus.values.byName(map['status'])
+          : DownloadStatus.values[(map['status'] ?? 0).clamp(0, DownloadStatus.values.length - 1)],
+
       error: map['error'],
       speed: (map['speed'] ?? 0.0).toDouble(),
-      type: map['type'] != null
-          ? DownloadType.values[map['type']]
+
+      // Safe enum parsing for `DownloadType`
+      type: map['type'] is String
+          ? DownloadType.values.byName(map['type'])
+          : map['type'] != null
+          ? DownloadType.values[(map['type']).clamp(0, DownloadType.values.length - 1)]
           : (MultithreadedDownloads.isM3u8Url(map['url'] ?? '')
           ? DownloadType.m3u8
-          : DownloadType.regular),
+          : DownloadType.http_batch),
     );
   }
+
 
   Map<String, dynamic> toMap() {
     return {
@@ -494,6 +454,6 @@ enum DownloadStatus {
 }
 
 enum DownloadType {
-  regular,
+  http_batch, //regular HTTP download
   m3u8,
 }

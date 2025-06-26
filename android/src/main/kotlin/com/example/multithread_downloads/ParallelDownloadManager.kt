@@ -258,7 +258,7 @@ class ParallelDownloadManager {
         } else -1
 
         onProgress(mapOf(
-            "type" to "http_download",
+            "type" to "http_batch",
             "url" to task.url,
             "filePath" to task.filePath,
             "progress" to progress,
@@ -418,7 +418,7 @@ class ParallelDownloadManager {
             } else 0
 
             mapOf(
-                "type" to "http_download",
+                "type" to "http_batch",
                 "url" to task.url,
                 "filePath" to task.filePath,
                 "progress" to progress,

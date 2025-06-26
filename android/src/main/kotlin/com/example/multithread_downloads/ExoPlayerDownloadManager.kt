@@ -169,7 +169,7 @@ class ExoPlayerDownloadManager {
         // Create download request
         val downloadRequest = DownloadRequest.Builder(url, android.net.Uri.parse(url))
             .setStreamKeys(emptyList())
-            .setCustomCacheKey(url)
+            .setCustomCacheKey("asd")
             .setData(filePath.toByteArray())
             .build()
 
@@ -206,7 +206,7 @@ class ExoPlayerDownloadManager {
         } else -1
 
         val progressData = mapOf(
-            "type" to "m3u8_download",
+            "type" to "m3u8",
             "url" to task.url,
             "filePath" to task.filePath,
             "progress" to progress,
@@ -309,7 +309,7 @@ class ExoPlayerDownloadManager {
             } else 0
 
             mapOf(
-                "type" to "m3u8_download",
+                "type" to "m3u8",
                 "url" to task.url,
                 "filePath" to task.filePath,
                 "progress" to progress,
