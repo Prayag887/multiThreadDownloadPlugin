@@ -20,6 +20,8 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
 
 class MultithreadDownloadsPlugin: FlutterPlugin, MethodCallHandler, EventChannel.StreamHandler {
@@ -49,8 +51,8 @@ class MultithreadDownloadsPlugin: FlutterPlugin, MethodCallHandler, EventChannel
           call.argument<Int>("timeoutSeconds") ?: 30
         ) {
           sendProgress(it)
-
-          println("downloadSingleFile: ${call.argument<String>("filePath")!!} ")}
+          println("downloadSingleFile: ${call.argument<String>("filePath")!!} ")
+        }
         result.success(true)
       }
       "pauseDownload" -> result.success(downloadManager.pauseDownload(call.argument<String>("url")!!))
@@ -133,11 +135,15 @@ class ParallelDownloadManager {
 
   // HTTP client optimized for parallel downloads
   private val client = OkHttpClient.Builder()
-    .connectionPool(ConnectionPool(20, 5, TimeUnit.MINUTES))
+    .connectionPool(ConnectionPool(200, 5, TimeUnit.MINUTES)) // Much higher connection pool
+    .dispatcher(Dispatcher().apply {
+      maxRequests = 200 // Increase max requests
+      maxRequestsPerHost = 100 // Increase per-host requests
+    })
     .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
-    .connectTimeout(15, TimeUnit.SECONDS)
-    .readTimeout(60, TimeUnit.SECONDS)
-    .writeTimeout(60, TimeUnit.SECONDS)
+    .connectTimeout(10, TimeUnit.SECONDS)
+    .readTimeout(30, TimeUnit.SECONDS)
+    .writeTimeout(30, TimeUnit.SECONDS)
     .retryOnConnectionFailure(true)
     .followRedirects(true)
     .followSslRedirects(true)
@@ -195,7 +201,9 @@ class ParallelDownloadManager {
     onProgress: (Map<String, Any>) -> Unit
   ) {
     withContext(Dispatchers.IO) {
-      val client = OkHttpClient()
+      task.status = DownloadStatus.DOWNLOADING
+      task.startTime = System.currentTimeMillis()
+
       val request = Request.Builder().url(task.url).apply {
         task.headers.forEach { (key, value) -> addHeader(key, value) }
       }.build()
@@ -211,8 +219,8 @@ class ParallelDownloadManager {
       val lines = masterM3u8Content.lines()
       val modifiedMasterPlaylist = StringBuilder()
 
-      var totalDownloadedBytes = 0L
-      var totalSegments = 0
+      val totalDownloadedBytes = AtomicLong(0L)
+      val totalSegments = AtomicInteger(0)
       val variantPlaylists = mutableListOf<Pair<String, String>>()
 
       // Process master playlist
@@ -221,102 +229,142 @@ class ParallelDownloadManager {
           modifiedMasterPlaylist.appendLine(line)
           continue
         }
-
-        // This is a variant playlist URL
         val variantUrl = baseUri.resolve(line.trim())!!.toString()
         val variantFileName = line.trim().substringAfterLast("/")
-
         variantPlaylists.add(Pair(variantUrl, variantFileName))
-        modifiedMasterPlaylist.appendLine(variantFileName) // Use local filename
+        modifiedMasterPlaylist.appendLine(variantFileName)
       }
 
-      // Save modified master playlist
       val localMasterM3U8 = File(playlistDir, "playlist_local.m3u8")
       localMasterM3U8.writeText(modifiedMasterPlaylist.toString())
 
-      // Download each variant playlist and its segments
-      for ((variantUrl, variantFileName) in variantPlaylists) {
-        try {
-          val variantRequest = Request.Builder().url(variantUrl).build()
-          val variantResponse = client.newCall(variantRequest).execute()
-
-          if (!variantResponse.isSuccessful) {
-            println("Failed to download variant playlist: $variantUrl")
-            continue
-          }
-
-          val variantContent = variantResponse.body?.string() ?: continue
-          val variantLines = variantContent.lines()
-          val modifiedVariantPlaylist = StringBuilder()
-
-          // Process variant playlist
-          for (variantLine in variantLines) {
-            if (variantLine.trim().isEmpty() || variantLine.startsWith("#")) {
-              modifiedVariantPlaylist.appendLine(variantLine)
-              continue
-            }
-
-            // This is a .ts segment
-            val segmentUrl = baseUri.resolve(variantLine.trim())!!.toString()
-            val segmentFileName = variantLine.trim().substringAfterLast("/")
-            val segmentFile = File(playlistDir, segmentFileName)
-
-            try {
-              // Skip if already downloaded
-              if (segmentFile.exists() && segmentFile.length() > 0) {
-                modifiedVariantPlaylist.appendLine(segmentFileName)
-                continue
-              }
-
-              val segmentRequest = Request.Builder().url(segmentUrl).build()
-              val segmentResponse = client.newCall(segmentRequest).execute()
-
-              if (!segmentResponse.isSuccessful) {
-                println("Failed to download segment: $segmentUrl")
-                // Keep original URL as fallback
-                modifiedVariantPlaylist.appendLine(variantLine)
-                continue
-              }
-
-              val segmentBytes = segmentResponse.body!!.bytes()
-              segmentFile.writeBytes(segmentBytes)
-
-              totalDownloadedBytes += segmentBytes.size
-              totalSegments++
-
-              // Use local filename in playlist
-              modifiedVariantPlaylist.appendLine(segmentFileName)
-
-              // Update progress
-              task.downloadedBytes = totalDownloadedBytes
-              task.status = DownloadStatus.DOWNLOADING
-              sendProgress(task, onProgress)
-
-              println("Downloaded segment: $segmentFileName (${segmentBytes.size} bytes)")
-
-            } catch (e: Exception) {
-              println("Error downloading segment $segmentFileName: ${e.message}")
-              // Keep original URL as fallback
-              modifiedVariantPlaylist.appendLine(variantLine)
-            }
-          }
-
-          // Save modified variant playlist
-          val localVariantFile = File(playlistDir, variantFileName)
-          localVariantFile.writeText(modifiedVariantPlaylist.toString())
-
-          println("Saved variant playlist: $variantFileName")
-
-        } catch (e: Exception) {
-          println("Error processing variant playlist $variantUrl: ${e.message}")
+      // Download all variants in parallel - NO AWAIT
+      variantPlaylists.forEach { (variantUrl, variantFileName) ->
+        launch {
+          downloadVariantPlaylist(
+            variantUrl, variantFileName, baseUri, playlistDir,
+            totalDownloadedBytes, totalSegments, task, onProgress
+          )
         }
       }
 
       task.status = DownloadStatus.COMPLETED
       task.filePath = localMasterM3U8.absolutePath
+      task.downloadedBytes = totalDownloadedBytes.get()
       sendProgress(task, onProgress)
+    }
+  }
 
-      println("HLS download completed. Total segments: $totalSegments, Total bytes: $totalDownloadedBytes")
+  private suspend fun downloadVariantPlaylist(
+    variantUrl: String,
+    variantFileName: String,
+    baseUri: HttpUrl,
+    playlistDir: File,
+    totalDownloadedBytes: AtomicLong,
+    totalSegments: AtomicInteger,
+    task: DownloadTask,
+    onProgress: (Map<String, Any>) -> Unit
+  ) {
+    try {
+      val variantRequest = Request.Builder().url(variantUrl).build()
+      val variantResponse = client.newCall(variantRequest).execute()
+
+      if (!variantResponse.isSuccessful) {
+        println("Failed to download variant playlist: $variantUrl")
+        return
+      }
+
+      val variantContent = variantResponse.body?.string() ?: return
+      val variantLines = variantContent.lines()
+      val modifiedVariantPlaylist = StringBuilder()
+
+      // Collect all segments first
+      val segments = mutableListOf<Pair<String, String>>()
+      for (variantLine in variantLines) {
+        if (variantLine.trim().isEmpty() || variantLine.startsWith("#")) {
+          modifiedVariantPlaylist.appendLine(variantLine)
+          continue
+        }
+        val segmentUrl = baseUri.resolve(variantLine.trim())!!.toString()
+        val segmentFileName = variantLine.trim().substringAfterLast("/")
+        segments.add(Pair(segmentUrl, segmentFileName))
+      }
+
+      // Download ALL segments in parallel immediately
+      coroutineScope {
+        segments.forEach { (segmentUrl, segmentFileName) ->
+          launch {
+            downloadSegment(
+              segmentUrl, segmentFileName, playlistDir,
+              totalDownloadedBytes, totalSegments, task, onProgress
+            )
+          }
+        }
+      }
+
+      // Rebuild playlist with local filenames
+      val finalModifiedPlaylist = StringBuilder()
+      for (variantLine in variantLines) {
+        if (variantLine.trim().isEmpty() || variantLine.startsWith("#")) {
+          finalModifiedPlaylist.appendLine(variantLine)
+        } else {
+          val segmentFileName = variantLine.trim().substringAfterLast("/")
+          finalModifiedPlaylist.appendLine(segmentFileName)
+        }
+      }
+
+      val localVariantFile = File(playlistDir, variantFileName)
+      localVariantFile.writeText(finalModifiedPlaylist.toString())
+
+    } catch (e: Exception) {
+      println("Error processing variant playlist $variantUrl: ${e.message}")
+    }
+  }
+
+  private suspend fun downloadSegment(
+    segmentUrl: String,
+    segmentFileName: String,
+    playlistDir: File,
+    totalDownloadedBytes: AtomicLong,
+    totalSegments: AtomicInteger,
+    task: DownloadTask,
+    onProgress: (Map<String, Any>) -> Unit
+  ): String {
+    val segmentFile = File(playlistDir, segmentFileName)
+
+    try {
+      // Skip if already downloaded
+      if (segmentFile.exists() && segmentFile.length() > 0) {
+        return segmentFileName
+      }
+
+      val segmentRequest = Request.Builder().url(segmentUrl).build()
+      val segmentResponse = client.newCall(segmentRequest).execute()
+
+      if (!segmentResponse.isSuccessful) {
+        println("Failed to download segment: $segmentUrl")
+        return segmentUrl // Return original URL as fallback
+      }
+
+      val segmentBytes = segmentResponse.body!!.bytes()
+      segmentFile.writeBytes(segmentBytes)
+
+      totalDownloadedBytes.addAndGet(segmentBytes.size.toLong())
+      totalSegments.incrementAndGet()
+
+      // Update progress periodically (throttled to avoid too frequent updates)
+      if (totalSegments.get() % 5 == 0) {
+        task.downloadedBytes = totalDownloadedBytes.get()
+        task.status = DownloadStatus.DOWNLOADING
+        sendProgress(task, onProgress)
+      }
+
+      println("Downloaded segment: $segmentFileName (${segmentBytes.size} bytes)")
+      return segmentFileName
+
+    } catch (e: Exception) {
+      println("Error downloading segment $segmentFileName: ${e.message}")
+      return segmentUrl // Return original URL as fallback
     }
   }
 
@@ -518,7 +566,13 @@ class ParallelDownloadManager {
 
         task.job = scope.launch {
           try {
-            downloadSingleFile(task, onProgress)
+            if (task.url.endsWith(".m3u8", ignoreCase = true)) {
+              // For HLS, we need to get the base path from the original file path
+              val basePath = File(task.filePath).parent ?: ""
+              downloadHlsStream(task, basePath, onProgress)
+            } else {
+              downloadSingleFile(task, onProgress)
+            }
           } catch (e: Exception) {
             task.status = DownloadStatus.FAILED
             task.error = e.message
@@ -559,7 +613,12 @@ class ParallelDownloadManager {
         task.speedHistory.clear()
         task.job = scope.launch {
           try {
-            downloadSingleFile(task, onProgress)
+            if (task.url.endsWith(".m3u8", ignoreCase = true)) {
+              val basePath = File(task.filePath).parent ?: ""
+              downloadHlsStream(task, basePath, onProgress)
+            } else {
+              downloadSingleFile(task, onProgress)
+            }
           } catch (e: Exception) {
             task.status = DownloadStatus.FAILED
             task.error = e.message
@@ -602,7 +661,12 @@ class ParallelDownloadManager {
           task.speedHistory.clear()
           task.job = scope.launch {
             try {
-              downloadSingleFile(task, onProgress)
+              if (task.url.endsWith(".m3u8", ignoreCase = true)) {
+                val basePath = File(task.filePath).parent ?: ""
+                downloadHlsStream(task, basePath, onProgress)
+              } else {
+                downloadSingleFile(task, onProgress)
+              }
             } catch (e: Exception) {
               task.status = DownloadStatus.FAILED
               task.error = e.message

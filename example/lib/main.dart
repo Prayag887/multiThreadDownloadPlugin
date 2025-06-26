@@ -14,6 +14,8 @@ void main() {
 }
 
 class MyApp extends StatefulWidget {
+  const MyApp({super.key});
+
   @override
   _MyAppState createState() => _MyAppState();
 }
@@ -329,7 +331,7 @@ class _MyAppState extends State<MyApp> {
                             ),
                           ],
                         ),
-                        if (download.status == DownloadStatus.completed) ...[
+                        // if (download.status == DownloadStatus.completed) ...[
                           const SizedBox(height: 8),
                           ElevatedButton(
                             onPressed: () {
@@ -350,7 +352,7 @@ class _MyAppState extends State<MyApp> {
                             child: const Text('Play'),
                           ),
                         ],
-                      ],
+                      // ],
                     ),
                   ),
                 );
