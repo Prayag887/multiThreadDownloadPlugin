@@ -11,21 +11,21 @@ import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import okhttp3.*
 import java.io.File
 import java.io.FileOutputStream
-import java.io.RandomAccessFile
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import kotlin.math.max
-import kotlin.math.min
 
 class MultithreadDownloadsPlugin: FlutterPlugin, MethodCallHandler, EventChannel.StreamHandler {
   private lateinit var channel: MethodChannel
   private lateinit var eventChannel: EventChannel
   private var eventSink: EventChannel.EventSink? = null
   private val mainHandler = Handler(Looper.getMainLooper())
-  private val downloadManager = AdvancedDownloadManager()
+  private val downloadManager = ParallelDownloadManager()
 
   override fun onAttachedToEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
     channel = MethodChannel(binding.binaryMessenger, "multithread_downloads")
@@ -37,13 +37,13 @@ class MultithreadDownloadsPlugin: FlutterPlugin, MethodCallHandler, EventChannel
   override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: Result) {
     when (call.method) {
       "startDownload" -> {
-        downloadManager.startDownload(
-          call.argument<String>("url")!!,
+        val urls = call.argument<List<String>>("urls") ?: emptyList()
+        downloadManager.startBatchDownload(
+          urls,
           call.argument<String>("filePath")!!,
           call.argument<Map<String, String>>("headers") ?: emptyMap(),
-          call.argument<Int>("maxConcurrentTasks") ?: 0, // 0 = auto-detect
-          call.argument<Int>("chunkSize") ?: 0, // 0 = auto-detect
-          call.argument<Int>("retryCount") ?: 5,
+          call.argument<Int>("maxConcurrentTasks") ?: 4,
+          call.argument<Int>("retryCount") ?: 3,
           call.argument<Int>("timeoutSeconds") ?: 30
         ) { sendProgress(it) }
         result.success(true)
@@ -55,8 +55,32 @@ class MultithreadDownloadsPlugin: FlutterPlugin, MethodCallHandler, EventChannel
         result.success(true)
       }
       "cancelDownload" -> result.success(downloadManager.cancelDownload(call.argument<String>("url")!!))
+      "pauseAllDownloads" -> result.success(downloadManager.pauseAllDownloads())
+      "resumeAllDownloads" -> {
+        downloadManager.resumeAllDownloads() { sendProgress(it) }
+        result.success(true)
+      }
+      "cancelAllDownloads" -> result.success(downloadManager.cancelAllDownloads())
+      "pauseDownloads" -> {
+        val urls = call.argument<List<String>>("urls") ?: emptyList()
+        result.success(downloadManager.pauseDownloads(urls))
+      }
+      "resumeDownloads" -> {
+        val urls = call.argument<List<String>>("urls") ?: emptyList()
+        downloadManager.resumeDownloads(urls) { sendProgress(it) }
+        result.success(true)
+      }
+      "cancelDownloads" -> {
+        val urls = call.argument<List<String>>("urls") ?: emptyList()
+        result.success(downloadManager.cancelDownloads(urls))
+      }
       "getDownloadStatus" -> result.success(downloadManager.getDownloadStatus(call.argument<String>("url")!!))
+      "getDownloadStatuses" -> {
+        val urls = call.argument<List<String>>("urls") ?: emptyList()
+        result.success(downloadManager.getDownloadStatuses(urls))
+      }
       "getAllDownloads" -> result.success(downloadManager.getAllDownloads())
+      "getBatchProgress" -> result.success(downloadManager.getBatchProgress())
       "clearCompletedDownloads" -> result.success(downloadManager.clearCompletedDownloads())
       else -> result.notImplemented()
     }
@@ -79,9 +103,8 @@ class MultithreadDownloadsPlugin: FlutterPlugin, MethodCallHandler, EventChannel
 data class DownloadTask(
   val url: String,
   val filePath: String,
+  val fileName: String,
   val headers: Map<String, String>,
-  var maxConcurrentTasks: Int,
-  var chunkSize: Int,
   val retryCount: Int,
   val timeoutSeconds: Int,
   var totalBytes: Long = 0,
@@ -91,23 +114,23 @@ data class DownloadTask(
   var startTime: Long = 0,
   var lastSpeedUpdate: Long = 0,
   var job: Job? = null,
-  var speedHistory: MutableList<Double> = mutableListOf(),
-  var connectionHealth: MutableMap<Int, Double> = mutableMapOf()
+  var speedHistory: MutableList<Double> = mutableListOf()
 )
 
 enum class DownloadStatus(val value: Int) {
   PENDING(0), DOWNLOADING(1), PAUSED(2), COMPLETED(3), FAILED(4), CANCELLED(5)
 }
 
-class AdvancedDownloadManager {
+class ParallelDownloadManager {
   private val downloads = ConcurrentHashMap<String, DownloadTask>()
   private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+  private var batchJob: Job? = null
 
-  // Advanced HTTP client with connection pooling and optimization
+  // HTTP client optimized for parallel downloads
   private val client = OkHttpClient.Builder()
-    .connectionPool(ConnectionPool(50, 5, TimeUnit.MINUTES))
+    .connectionPool(ConnectionPool(20, 5, TimeUnit.MINUTES))
     .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
-    .connectTimeout(10, TimeUnit.SECONDS)
+    .connectTimeout(15, TimeUnit.SECONDS)
     .readTimeout(60, TimeUnit.SECONDS)
     .writeTimeout(60, TimeUnit.SECONDS)
     .retryOnConnectionFailure(true)
@@ -115,26 +138,56 @@ class AdvancedDownloadManager {
     .followSslRedirects(true)
     .build()
 
-  fun startDownload(
-    url: String, filePath: String, headers: Map<String, String>,
-    maxConcurrentTasks: Int, chunkSize: Int, retryCount: Int, timeoutSeconds: Int,
+  fun startBatchDownload(
+    urls: List<String>,
+    basePath: String,
+    headers: Map<String, String>,
+    maxConcurrentTasks: Int,
+    retryCount: Int,
+    timeoutSeconds: Int,
     onProgress: (Map<String, Any>) -> Unit
   ) {
-    val task = DownloadTask(url, filePath, headers, maxConcurrentTasks, chunkSize, retryCount, timeoutSeconds)
-    downloads[url] = task
+    // Cancel any existing batch download
+    batchJob?.cancel()
 
-    task.job = scope.launch {
-      try {
-        downloadFile(task, onProgress)
-      } catch (e: Exception) {
-        task.status = DownloadStatus.FAILED
-        task.error = e.message
-        sendProgress(task, onProgress)
+    // Create download tasks for each URL
+    urls.forEach { url ->
+      val fileName = extractFileName(url)
+      val fullPath = File(basePath, fileName).absolutePath
+      val task = DownloadTask(url, fullPath, fileName, headers, retryCount, timeoutSeconds)
+      downloads[url] = task
+    }
+
+    // Start batch download with controlled concurrency
+    batchJob = scope.launch {
+      // Use semaphore to limit concurrent downloads
+      val semaphore = Semaphore(maxConcurrentTasks)
+
+      val downloadJobs = urls.map { url ->
+        async {
+          semaphore.withPermit {
+            downloads[url]?.let { task ->
+              try {
+                downloadSingleFile(task, onProgress)
+              } catch (e: Exception) {
+                task.status = DownloadStatus.FAILED
+                task.error = e.message
+                sendProgress(task, onProgress)
+              }
+            }
+          }
+        }
       }
+
+      // Wait for all downloads to complete
+      downloadJobs.awaitAll()
+
+      // Send final batch progress
+      sendBatchProgress(onProgress)
     }
   }
 
-  private suspend fun downloadFile(task: DownloadTask, onProgress: (Map<String, Any>) -> Unit) {
+  private suspend fun downloadSingleFile(task: DownloadTask, onProgress: (Map<String, Any>) -> Unit) {
     val file = File(task.filePath).apply { parentFile?.mkdirs() }
     task.downloadedBytes = if (file.exists()) file.length() else 0L
 
@@ -142,61 +195,18 @@ class AdvancedDownloadManager {
     task.startTime = System.currentTimeMillis()
     task.lastSpeedUpdate = task.startTime
 
-    // Get file info and optimize parameters
-    val (totalBytes, supportsRanges) = getFileInfo(task)
+    // Get file info
+    val totalBytes = getFileSize(task)
     task.totalBytes = totalBytes
-
-    // Auto-optimize download parameters
-    optimizeDownloadParameters(task)
 
     sendProgress(task, onProgress)
 
-    if (totalBytes <= 0 || !supportsRanges || totalBytes <= task.chunkSize || task.maxConcurrentTasks <= 1) {
-      downloadSingleThreaded(task, onProgress)
-    } else {
-      downloadMultiThreadedAdvanced(task, onProgress)
-    }
-  }
-
-  private fun optimizeDownloadParameters(task: DownloadTask) {
-    // Auto-detect optimal thread count based on file size
-    if (task.maxConcurrentTasks == 0) {
-      task.maxConcurrentTasks = getOptimalThreadCount(task.totalBytes)
-    }
-
-    // Auto-detect optimal chunk size
-    if (task.chunkSize == 0) {
-      task.chunkSize = getOptimalChunkSize(task.totalBytes)
-    }
-  }
-
-  private fun getOptimalThreadCount(fileSize: Long): Int {
-    return when {
-      fileSize > 500 * 1024 * 1024 -> 16  // 500MB+ -> 16 threads
-      fileSize > 100 * 1024 * 1024 -> 12  // 100MB+ -> 12 threads
-      fileSize > 50 * 1024 * 1024 -> 8    // 50MB+ -> 8 threads
-      fileSize > 10 * 1024 * 1024 -> 6    // 10MB+ -> 6 threads
-      fileSize > 1024 * 1024 -> 4         // 1MB+ -> 4 threads
-      else -> 1
-    }
-  }
-
-  private fun getOptimalChunkSize(fileSize: Long): Int {
-    return when {
-      fileSize > 1024 * 1024 * 1024 -> 4 * 1024 * 1024  // 1GB+ -> 4MB chunks
-      fileSize > 100 * 1024 * 1024 -> 2 * 1024 * 1024   // 100MB+ -> 2MB chunks
-      fileSize > 10 * 1024 * 1024 -> 1024 * 1024         // 10MB+ -> 1MB chunks
-      fileSize > 1024 * 1024 -> 512 * 1024               // 1MB+ -> 512KB chunks
-      else -> 256 * 1024                                 // < 1MB -> 256KB chunks
-    }
-  }
-
-  private suspend fun downloadSingleThreaded(task: DownloadTask, onProgress: (Map<String, Any>) -> Unit) {
+    // Download with retry logic
     repeat(task.retryCount + 1) { attempt ->
       if (task.status != DownloadStatus.DOWNLOADING) return
 
       try {
-        val request = buildAdvancedRequest(task.url, task.headers, task.downloadedBytes)
+        val request = buildRequest(task.url, task.headers, task.downloadedBytes)
         client.newCall(request).execute().use { response ->
           if (!response.isSuccessful && response.code != 206) {
             throw Exception("HTTP ${response.code}: ${response.message}")
@@ -209,15 +219,15 @@ class AdvancedDownloadManager {
             }
           }
 
-          // Fixed: Create FileOutputStream properly for append mode
+          // Download the file
           val outputStream = if (task.downloadedBytes > 0) {
-            FileOutputStream(task.filePath, true) // true for append mode
+            FileOutputStream(task.filePath, true) // Append mode for resume
           } else {
-            FileOutputStream(task.filePath, false) // false for overwrite mode
+            FileOutputStream(task.filePath, false) // Overwrite mode for new download
           }
 
           outputStream.use { output ->
-            val buffer = ByteArray(16384) // Larger buffer for single thread
+            val buffer = ByteArray(16384) // 16KB buffer
             var lastUpdate = 0L
             var bytesInInterval = 0L
 
@@ -234,6 +244,7 @@ class AdvancedDownloadManager {
                 if (now - lastUpdate > 1000) { // Update every second
                   updateSpeedHistory(task, bytesInInterval, now - lastUpdate)
                   sendProgress(task, onProgress)
+                  sendBatchProgress(onProgress)
                   lastUpdate = now
                   bytesInInterval = 0L
                 }
@@ -244,6 +255,7 @@ class AdvancedDownloadManager {
           if (task.status == DownloadStatus.DOWNLOADING) {
             task.status = DownloadStatus.COMPLETED
             sendProgress(task, onProgress)
+            sendBatchProgress(onProgress)
           }
           return
         }
@@ -261,156 +273,39 @@ class AdvancedDownloadManager {
     }
   }
 
-  private suspend fun downloadMultiThreadedAdvanced(task: DownloadTask, onProgress: (Map<String, Any>) -> Unit) {
-    val remainingBytes = task.totalBytes - task.downloadedBytes
-    val numThreads = min(task.maxConcurrentTasks, (remainingBytes / task.chunkSize + 1).toInt())
-
-    // Fixed: Use max function with proper Long types
-    val dynamicChunkSize = max(task.chunkSize.toLong(), remainingBytes / numThreads)
-
-    RandomAccessFile(task.filePath, "rw").use { raf ->
-      val jobs = (0 until numThreads).map { i ->
-        val startByte = task.downloadedBytes + i * dynamicChunkSize
-        val endByte = if (i == numThreads - 1) task.totalBytes - 1
-        else task.downloadedBytes + (i + 1) * dynamicChunkSize - 1
-
-        scope.launch {
-          downloadChunkAdvanced(task, startByte, endByte, raf, i, onProgress)
-        }
+  private fun extractFileName(url: String): String {
+    return try {
+      val uri = java.net.URI(url)
+      val path = uri.path
+      val fileName = path.substringAfterLast('/')
+      if (fileName.isNotEmpty() && fileName.contains('.')) {
+        fileName
+      } else {
+        "download_${System.currentTimeMillis()}.tmp"
       }
+    } catch (e: Exception) {
+      "download_${System.currentTimeMillis()}.tmp"
+    }
+  }
 
-      // Monitor download progress and adjust if needed
-      val monitorJob = scope.launch {
-        monitorAndAdjustDownload(task, onProgress)
+  private suspend fun getFileSize(task: DownloadTask): Long {
+    return try {
+      val request = buildRequest(task.url, task.headers)
+      client.newCall(request).execute().use { response ->
+        if (!response.isSuccessful) return -1L
+        val size = response.header("Content-Length")?.toLongOrNull() ?: -1L
+        response.close()
+        size
       }
-
-      jobs.joinAll()
-      monitorJob.cancel()
-    }
-
-    if (task.status == DownloadStatus.DOWNLOADING) {
-      task.status = DownloadStatus.COMPLETED
-      sendProgress(task, onProgress)
+    } catch (e: Exception) {
+      -1L
     }
   }
 
-  private suspend fun downloadChunkAdvanced(
-    task: DownloadTask, startByte: Long, endByte: Long,
-    raf: RandomAccessFile, threadId: Int, onProgress: (Map<String, Any>) -> Unit
-  ) {
-    var currentStart = startByte
-    var consecutiveFailures = 0
-
-    repeat(task.retryCount + 1) { attempt ->
-      if (task.status != DownloadStatus.DOWNLOADING) return
-
-      try {
-        val request = buildAdvancedRequest(task.url, task.headers, currentStart, endByte)
-        val startTime = System.currentTimeMillis()
-
-        client.newCall(request).execute().use { response ->
-          if (!response.isSuccessful && response.code != 206) {
-            throw Exception("HTTP ${response.code}: ${response.message}")
-          }
-
-          val buffer = ByteArray(8192)
-          var bytesRead: Int
-          var bytesInThisAttempt = 0L
-
-          response.body!!.byteStream().use { input ->
-            while (input.read(buffer).also { bytesRead = it } != -1 &&
-              task.status == DownloadStatus.DOWNLOADING) {
-
-              synchronized(raf) {
-                raf.seek(currentStart)
-                raf.write(buffer, 0, bytesRead)
-              }
-
-              currentStart += bytesRead
-              bytesInThisAttempt += bytesRead
-
-              synchronized(task) {
-                task.downloadedBytes += bytesRead
-              }
-            }
-          }
-
-          // Track connection health
-          val connectionTime = System.currentTimeMillis() - startTime
-          val speed = if (connectionTime > 0) (bytesInThisAttempt * 1000.0 / connectionTime) else 0.0
-          task.connectionHealth[threadId] = speed
-
-          consecutiveFailures = 0
-        }
-        return
-
-      } catch (e: Exception) {
-        consecutiveFailures++
-
-        if (attempt == task.retryCount) {
-          task.status = DownloadStatus.FAILED
-          task.error = "Thread $threadId failed: ${e.message}"
-          throw e
-        }
-
-        // Adaptive backoff based on failure type and thread performance
-        val baseDelay = if (e is java.net.SocketTimeoutException) 2000L else 1000L
-        val backoffDelay = baseDelay * (1 shl min(consecutiveFailures, 4)) + (0..1000).random()
-        delay(backoffDelay)
-      }
-    }
-  }
-
-  private suspend fun monitorAndAdjustDownload(task: DownloadTask, onProgress: (Map<String, Any>) -> Unit) {
-    while (task.status == DownloadStatus.DOWNLOADING) {
-      delay(2000) // Check every 2 seconds
-
-      val currentTime = System.currentTimeMillis()
-      val timeElapsed = currentTime - task.lastSpeedUpdate
-
-      if (timeElapsed > 0) {
-        val currentSpeed = (task.downloadedBytes * 1000.0 / (currentTime - task.startTime))
-        updateSpeedHistory(task, task.downloadedBytes, timeElapsed)
-
-        // Adjust chunk size based on current performance
-        adjustChunkSizeBasedOnSpeed(task, currentSpeed)
-
-        sendProgress(task, onProgress)
-        task.lastSpeedUpdate = currentTime
-      }
-    }
-  }
-
-  private fun updateSpeedHistory(task: DownloadTask, bytes: Long, timeMs: Long) {
-    val speed = if (timeMs > 0) (bytes * 1000.0 / timeMs) else 0.0
-    task.speedHistory.add(speed)
-
-    // Keep only last 10 speed measurements
-    if (task.speedHistory.size > 10) {
-      task.speedHistory.removeAt(0)
-    }
-  }
-
-  private fun adjustChunkSizeBasedOnSpeed(task: DownloadTask, currentSpeed: Double) {
-    val newChunkSize = when {
-      currentSpeed > 10_000_000 -> 4 * 1024 * 1024  // 10MB/s+ -> 4MB chunks
-      currentSpeed > 5_000_000 -> 2 * 1024 * 1024   // 5MB/s+ -> 2MB chunks
-      currentSpeed > 1_000_000 -> 1024 * 1024        // 1MB/s+ -> 1MB chunks
-      currentSpeed > 500_000 -> 512 * 1024           // 500KB/s+ -> 512KB chunks
-      else -> 256 * 1024                             // < 500KB/s -> 256KB chunks
-    }
-
-    // Only adjust if significantly different
-    if (kotlin.math.abs(newChunkSize - task.chunkSize) > task.chunkSize * 0.5) {
-      task.chunkSize = newChunkSize
-    }
-  }
-
-  private fun buildAdvancedRequest(
+  private fun buildRequest(
     url: String,
     headers: Map<String, String>,
-    startByte: Long = 0,
-    endByte: Long = -1
+    startByte: Long = 0
   ): Request {
     return Request.Builder()
       .url(url)
@@ -420,38 +315,20 @@ class AdvancedDownloadManager {
       .addHeader("Connection", "keep-alive")
       .apply {
         if (startByte > 0) {
-          addHeader("Range", if (endByte > 0) "bytes=$startByte-$endByte" else "bytes=$startByte-")
+          addHeader("Range", "bytes=$startByte-")
         }
         headers.forEach { (key, value) -> addHeader(key, value) }
       }
       .build()
   }
 
-  private suspend fun getFileInfo(task: DownloadTask): Pair<Long, Boolean> {
-    return try {
-      val request = buildAdvancedRequest(task.url, task.headers)
-      client.newCall(request).execute().use { response ->
-        if (!response.isSuccessful) {
-          return -1L to false
-        }
+  private fun updateSpeedHistory(task: DownloadTask, bytes: Long, timeMs: Long) {
+    val speed = if (timeMs > 0) (bytes * 1000.0 / timeMs) else 0.0
+    task.speedHistory.add(speed)
 
-        val size = response.header("Content-Length")?.toLongOrNull() ?: -1L
-        val acceptsRanges = response.header("Accept-Ranges")?.equals("bytes", true) == true
-
-        response.close()
-
-        if (size <= 0) return -1L to false
-
-        // Test range request capability
-        val rangeRequest = buildAdvancedRequest(task.url, task.headers, 0, 1)
-        client.newCall(rangeRequest).execute().use { rangeResponse ->
-          val supportsRanges = rangeResponse.code == 206 && acceptsRanges
-          rangeResponse.close()
-          size to supportsRanges
-        }
-      }
-    } catch (e: Exception) {
-      -1L to false
+    // Keep only last 10 speed measurements
+    if (task.speedHistory.size > 10) {
+      task.speedHistory.removeAt(0)
     }
   }
 
@@ -470,10 +347,6 @@ class AdvancedDownloadManager {
       (task.downloadedBytes * 100.0 / task.totalBytes).toInt()
     } else -1
 
-    val eta = if (avgSpeed > 0 && task.totalBytes > 0) {
-      ((task.totalBytes - task.downloadedBytes) / avgSpeed).toLong()
-    } else -1L
-
     onProgress(mapOf(
       "url" to task.url,
       "filePath" to task.filePath,
@@ -482,10 +355,15 @@ class AdvancedDownloadManager {
       "totalBytes" to task.totalBytes,
       "status" to task.status.value,
       "error" to (task.error ?: ""),
-      "speed" to avgSpeed,
-      "eta" to eta,
-      "activeConnections" to task.connectionHealth.size
+      "speed" to avgSpeed
     ))
+  }
+
+  private fun sendBatchProgress(onProgress: (Map<String, Any>) -> Unit) {
+    val batchProgress = getBatchProgress()
+    batchProgress?.let { progress ->
+      onProgress(progress + ("isBatchProgress" to true))
+    }
   }
 
   fun pauseDownload(url: String): Boolean {
@@ -501,12 +379,11 @@ class AdvancedDownloadManager {
   fun resumeDownload(url: String, onProgress: (Map<String, Any>) -> Unit) {
     downloads[url]?.let { task ->
       if (task.status == DownloadStatus.PAUSED) {
-        task.connectionHealth.clear() // Reset connection health
         task.speedHistory.clear() // Reset speed history
 
         task.job = scope.launch {
           try {
-            downloadFile(task, onProgress)
+            downloadSingleFile(task, onProgress)
           } catch (e: Exception) {
             task.status = DownloadStatus.FAILED
             task.error = e.message
@@ -527,6 +404,95 @@ class AdvancedDownloadManager {
     } ?: false
   }
 
+  fun pauseAllDownloads(): Boolean {
+    var hasActive = false
+    downloads.values.forEach { task ->
+      if (task.status == DownloadStatus.DOWNLOADING) {
+        task.status = DownloadStatus.PAUSED
+        task.job?.cancel()
+        hasActive = true
+      }
+    }
+    batchJob?.cancel()
+    return hasActive
+  }
+
+  fun resumeAllDownloads(onProgress: (Map<String, Any>) -> Unit) {
+    val pausedTasks = downloads.values.filter { it.status == DownloadStatus.PAUSED }
+    if (pausedTasks.isNotEmpty()) {
+      pausedTasks.forEach { task ->
+        task.speedHistory.clear()
+        task.job = scope.launch {
+          try {
+            downloadSingleFile(task, onProgress)
+          } catch (e: Exception) {
+            task.status = DownloadStatus.FAILED
+            task.error = e.message
+            sendProgress(task, onProgress)
+          }
+        }
+      }
+    }
+  }
+
+  fun cancelAllDownloads(): Boolean {
+    batchJob?.cancel()
+    downloads.values.forEach { task ->
+      task.status = DownloadStatus.CANCELLED
+      task.job?.cancel()
+      File(task.filePath).delete()
+    }
+    downloads.clear()
+    return true
+  }
+
+  fun pauseDownloads(urls: List<String>): Boolean {
+    var hasActive = false
+    urls.forEach { url ->
+      downloads[url]?.let { task ->
+        if (task.status == DownloadStatus.DOWNLOADING) {
+          task.status = DownloadStatus.PAUSED
+          task.job?.cancel()
+          hasActive = true
+        }
+      }
+    }
+    return hasActive
+  }
+
+  fun resumeDownloads(urls: List<String>, onProgress: (Map<String, Any>) -> Unit) {
+    urls.forEach { url ->
+      downloads[url]?.let { task ->
+        if (task.status == DownloadStatus.PAUSED) {
+          task.speedHistory.clear()
+          task.job = scope.launch {
+            try {
+              downloadSingleFile(task, onProgress)
+            } catch (e: Exception) {
+              task.status = DownloadStatus.FAILED
+              task.error = e.message
+              sendProgress(task, onProgress)
+            }
+          }
+        }
+      }
+    }
+  }
+
+  fun cancelDownloads(urls: List<String>): Boolean {
+    var hasActive = false
+    urls.forEach { url ->
+      downloads[url]?.let { task ->
+        task.status = DownloadStatus.CANCELLED
+        task.job?.cancel()
+        File(task.filePath).delete()
+        downloads.remove(url)
+        hasActive = true
+      }
+    }
+    return hasActive
+  }
+
   fun getDownloadStatus(url: String): Map<String, Any>? {
     return downloads[url]?.let { task ->
       val currentTime = System.currentTimeMillis()
@@ -539,9 +505,6 @@ class AdvancedDownloadManager {
       val progress = if (task.totalBytes > 0) {
         (task.downloadedBytes * 100.0 / task.totalBytes).toInt()
       } else 0
-      val eta = if (avgSpeed > 0 && task.totalBytes > 0) {
-        ((task.totalBytes - task.downloadedBytes) / avgSpeed).toLong()
-      } else -1L
 
       mapOf(
         "url" to task.url,
@@ -551,11 +514,56 @@ class AdvancedDownloadManager {
         "totalBytes" to task.totalBytes,
         "status" to task.status.value,
         "error" to (task.error ?: ""),
-        "speed" to avgSpeed,
-        "eta" to eta,
-        "activeConnections" to task.connectionHealth.size
+        "speed" to avgSpeed
       )
     }
+  }
+
+  fun getDownloadStatuses(urls: List<String>): List<Map<String, Any>> {
+    return urls.mapNotNull { getDownloadStatus(it) }
+  }
+
+  fun getBatchProgress(): Map<String, Any>? {
+    if (downloads.isEmpty()) return null
+
+    val allTasks = downloads.values.toList()
+    val totalBytes = allTasks.sumOf { it.totalBytes }
+    val downloadedBytes = allTasks.sumOf { it.downloadedBytes }
+    val completedCount = allTasks.count { it.status == DownloadStatus.COMPLETED }
+    val failedCount = allTasks.count { it.status == DownloadStatus.FAILED }
+    val activeCount = allTasks.count { it.status == DownloadStatus.DOWNLOADING }
+    val pausedCount = allTasks.count { it.status == DownloadStatus.PAUSED }
+
+    val overallProgress = if (totalBytes > 0) {
+      (downloadedBytes * 100.0 / totalBytes).toInt()
+    } else 0
+
+    val averageSpeed = allTasks
+      .filter { it.speedHistory.isNotEmpty() }
+      .map { it.speedHistory.average() }
+      .takeIf { it.isNotEmpty() }
+      ?.average() ?: 0.0
+
+    return mapOf(
+      "urls" to allTasks.map { it.url },
+      "overallProgress" to overallProgress,
+      "totalBytesDownloaded" to downloadedBytes,
+      "totalBytes" to totalBytes,
+      "completedDownloads" to completedCount,
+      "failedDownloads" to failedCount,
+      "activeDownloads" to activeCount,
+      "pausedDownloads" to pausedCount,
+      "totalDownloads" to allTasks.size,
+      "averageSpeed" to averageSpeed,
+      "individualProgress" to allTasks.map { task ->
+        mapOf(
+          "url" to task.url,
+          "progress" to if (task.totalBytes > 0) (task.downloadedBytes * 100.0 / task.totalBytes).toInt() else 0,
+          "status" to task.status.value,
+          "speed" to if (task.speedHistory.isNotEmpty()) task.speedHistory.average() else 0.0
+        )
+      }
+    )
   }
 
   fun getAllDownloads(): List<Map<String, Any>> = downloads.values.mapNotNull { getDownloadStatus(it.url) }
@@ -563,10 +571,5 @@ class AdvancedDownloadManager {
   fun clearCompletedDownloads(): Boolean {
     downloads.entries.removeAll { it.value.status == DownloadStatus.COMPLETED }
     return true
-  }
-
-  fun cancelAllDownloads() {
-    downloads.values.forEach { it.job?.cancel() }
-    downloads.clear()
   }
 }

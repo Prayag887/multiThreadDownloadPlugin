@@ -9,7 +9,7 @@ import 'package:permission_handler/permission_handler.dart';
 void main() {
   runApp(
     MaterialApp(
-      title: 'Multithreaded Downloads',
+      title: 'Multi-URL Downloads',
       theme: ThemeData(
         primarySwatch: Colors.blue,
         visualDensity: VisualDensity.adaptivePlatformDensity,
@@ -28,20 +28,36 @@ class MyApp extends StatefulWidget {
 
 class _MyAppState extends State<MyApp> {
   List<DownloadProgress> downloads = [];
-  final String _downloadUrl = 'https://nbg1-speed.hetzner.com//1GB.bin';
-  final TextEditingController _urlController = TextEditingController();
+  BatchDownloadProgress? batchProgress;
+
+  final List<String> _defaultUrls = [
+    'https://nbg1-speed.hetzner.com/1GB.bin',
+    'https://nbg1-speed.hetzner.com/100MB.bin',
+    'https://nbg1-speed.hetzner.com/10MB.bin',
+  ];
+
+  final TextEditingController _urlsController = TextEditingController();
+  final TextEditingController _maxTasksController = TextEditingController();
 
   // Track button states to prevent multiple taps
-  Map<String, bool> _buttonStates = {};
+  final Map<String, bool> _buttonStates = {};
+  bool _isBatchOperationInProgress = false;
 
   @override
   void initState() {
     super.initState();
-    _urlController.text = _downloadUrl;
+    _urlsController.text = _defaultUrls.join('\n');
+    _maxTasksController.text = '4';
 
     // Listen to download progress
     MultithreadedDownloads.progressStream.listen((progress) {
       setState(() {
+        // Check if this is batch progress
+        if (progress.url == '' && progress.filePath == '') {
+          // This is likely batch progress - handle accordingly
+          return;
+        }
+
         final index = downloads.indexWhere((d) => d.url == progress.url);
         if (index != -1) {
           downloads[index] = progress;
@@ -58,9 +74,25 @@ class _MyAppState extends State<MyApp> {
           _buttonStates[progress.url] = false;
         }
       });
+
+      // Update batch progress periodically
+      _updateBatchProgress();
     });
 
     _requestPermissions();
+  }
+
+  Future<void> _updateBatchProgress() async {
+    try {
+      final progress = await MultithreadedDownloads.getBatchProgress();
+      if (progress != null) {
+        setState(() {
+          batchProgress = progress;
+        });
+      }
+    } catch (e) {
+      // Handle error silently
+    }
   }
 
   Future<void> _requestPermissions() async {
@@ -69,7 +101,15 @@ class _MyAppState extends State<MyApp> {
     }
   }
 
-  Future<void> startDownload() async {
+  List<String> _parseUrls(String input) {
+    return input
+        .split('\n')
+        .map((url) => url.trim())
+        .where((url) => url.isNotEmpty && Uri.tryParse(url) != null)
+        .toList();
+  }
+
+  Future<void> startBatchDownload() async {
     try {
       // Get the downloads directory
       Directory? directory;
@@ -85,30 +125,18 @@ class _MyAppState extends State<MyApp> {
         directory = await getApplicationDocumentsDirectory();
       }
 
-      final url = _urlController.text.trim();
-      if (url.isEmpty) {
-        _showSnackBar('Please enter a valid URL');
+      final urls = _parseUrls(_urlsController.text.trim());
+      if (urls.isEmpty) {
+        _showSnackBar('Please enter valid URLs (one per line)');
         return;
       }
 
-      // Extract filename from URL or use default
-      final uri = Uri.parse(url);
-      String filename = uri.pathSegments.isNotEmpty
-          ? uri.pathSegments.last
-          : 'downloaded_file_${DateTime.now().millisecondsSinceEpoch}';
-
-      // If no extension, add .bin
-      if (!filename.contains('.')) {
-        filename += '.bin';
-      }
-
-      final filePath = '${directory.path}/$filename';
+      final maxTasks = int.tryParse(_maxTasksController.text) ?? 4;
 
       final success = await MultithreadedDownloads.startDownload(
-        url: url,
-        filePath: filePath,
-        maxConcurrentTasks: 4,
-        chunkSize: 1024 * 1024,
+        urls: urls,
+        filePath: directory.path,
+        maxConcurrentTasks: maxTasks,
         retryCount: 3,
         timeoutSeconds: 30,
         headers: {
@@ -117,9 +145,12 @@ class _MyAppState extends State<MyApp> {
       );
 
       if (success) {
-        _showSnackBar('Download started: $filename');
+        _showSnackBar('Batch download started (${urls.length} files)');
+        setState(() {
+          _isBatchOperationInProgress = false;
+        });
       } else {
-        _showSnackBar('Failed to start download');
+        _showSnackBar('Failed to start batch download');
       }
     } catch (e) {
       _showSnackBar('Error: ${e.toString()}');
@@ -140,14 +171,83 @@ class _MyAppState extends State<MyApp> {
     if (success) {
       setState(() {
         downloads.removeWhere((d) => d.status == DownloadStatus.completed);
+        batchProgress = null;
       });
       _showSnackBar('Completed downloads cleared');
     }
   }
 
+  Future<void> _pauseAllDownloads() async {
+    if (_isBatchOperationInProgress) return;
+
+    setState(() {
+      _isBatchOperationInProgress = true;
+    });
+
+    try {
+      final success = await MultithreadedDownloads.pauseAllDownloads();
+      if (success) {
+        _showSnackBar('All downloads paused');
+      } else {
+        _showSnackBar('No active downloads to pause');
+      }
+    } catch (e) {
+      _showSnackBar('Error pausing downloads: ${e.toString()}');
+    } finally {
+      setState(() {
+        _isBatchOperationInProgress = false;
+      });
+    }
+  }
+
+  Future<void> _resumeAllDownloads() async {
+    if (_isBatchOperationInProgress) return;
+
+    setState(() {
+      _isBatchOperationInProgress = true;
+    });
+
+    try {
+      await MultithreadedDownloads.resumeAllDownloads();
+      _showSnackBar('All downloads resumed');
+    } catch (e) {
+      _showSnackBar('Error resuming downloads: ${e.toString()}');
+    } finally {
+      setState(() {
+        _isBatchOperationInProgress = false;
+      });
+    }
+  }
+
+  Future<void> _cancelAllDownloads() async {
+    if (_isBatchOperationInProgress) return;
+
+    setState(() {
+      _isBatchOperationInProgress = true;
+    });
+
+    try {
+      final success = await MultithreadedDownloads.cancelAllDownloads();
+      if (success) {
+        setState(() {
+          downloads.clear();
+          batchProgress = null;
+        });
+        _showSnackBar('All downloads cancelled');
+      }
+    } catch (e) {
+      _showSnackBar('Error cancelling downloads: ${e.toString()}');
+    } finally {
+      setState(() {
+        _isBatchOperationInProgress = false;
+      });
+    }
+  }
+
   Future<void> _pauseDownload(DownloadProgress download, String url) async {
-    if (_buttonStates[url] == true) return; // Prevent multiple taps
     download.status = DownloadStatus.paused;
+    if (_buttonStates[url] == true) return;
+
     setState(() {
       _buttonStates[url] = true;
     });
@@ -156,18 +256,12 @@ class _MyAppState extends State<MyApp> {
       final success = await MultithreadedDownloads.pauseDownload(url);
       if (success) {
         _showSnackBar('Download paused');
-        // Reset button state immediately for pause since it should be instant
-        setState(() {
-          _buttonStates[url] = false;
-        });
       } else {
         _showSnackBar('Failed to pause download');
-        setState(() {
-          _buttonStates[url] = false;
-        });
       }
     } catch (e) {
       _showSnackBar('Error pausing download: ${e.toString()}');
+    } finally {
       setState(() {
         _buttonStates[url] = false;
       });
@@ -175,28 +269,18 @@ class _MyAppState extends State<MyApp> {
   }
 
   Future<void> _resumeDownload(String url) async {
-    if (_buttonStates[url] == true) return; // Prevent multiple taps
+    if (_buttonStates[url] == true) return;
 
     setState(() {
       _buttonStates[url] = true;
     });
 
     try {
-      final success = await MultithreadedDownloads.resumeDownload(url);
-      if (success) {
-        _showSnackBar('Download resumed');
-        // Reset button state immediately for resume since it should be instant
-        setState(() {
-          _buttonStates[url] = false;
-        });
-      } else {
-        _showSnackBar('Failed to resume download');
-        setState(() {
-          _buttonStates[url] = false;
-        });
-      }
+      await MultithreadedDownloads.resumeDownload(url);
+      _showSnackBar('Download resumed');
     } catch (e) {
       _showSnackBar('Error resuming download: ${e.toString()}');
+    } finally {
       setState(() {
         _buttonStates[url] = false;
       });
@@ -204,7 +288,7 @@ class _MyAppState extends State<MyApp> {
   }
 
   Future<void> _cancelDownload(String url) async {
-    if (_buttonStates[url] == true) return; // Prevent multiple taps
+    if (_buttonStates[url] == true) return;
 
     setState(() {
       _buttonStates[url] = true;
@@ -213,19 +297,16 @@ class _MyAppState extends State<MyApp> {
     try {
       final success = await MultithreadedDownloads.cancelDownload(url);
       if (success) {
-        _showSnackBar('Download cancelled');
-        // Reset button state immediately for cancel since it should be instant
         setState(() {
-          _buttonStates[url] = false;
+          downloads.removeWhere((d) => d.url == url);
         });
+        _showSnackBar('Download cancelled');
       } else {
         _showSnackBar('Failed to cancel download');
-        setState(() {
-          _buttonStates[url] = false;
-        });
       }
     } catch (e) {
       _showSnackBar('Error cancelling download: ${e.toString()}');
+    } finally {
       setState(() {
         _buttonStates[url] = false;
       });
@@ -236,12 +317,32 @@ class _MyAppState extends State<MyApp> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text('Multithreaded Downloads'),
+        title: Text('Multi-URL Downloads'),
         actions: [
-          IconButton(
-            icon: Icon(Icons.clear_all),
-            onPressed: _clearCompletedDownloads,
-            tooltip: 'Clear Completed',
+          PopupMenuButton<String>(
+            onSelected: (value) {
+              switch (value) {
+                case 'pause_all':
+                  _pauseAllDownloads();
+                  break;
+                case 'resume_all':
+                  _resumeAllDownloads();
+                  break;
+                case 'cancel_all':
+                  _cancelAllDownloads();
+                  break;
+                case 'clear_completed':
+                  _clearCompletedDownloads();
+                  break;
+              }
+            },
+            itemBuilder: (context) => [
+              PopupMenuItem(value: 'pause_all', child: Text('Pause All')),
+              PopupMenuItem(value: 'resume_all', child: Text('Resume All')),
+              PopupMenuItem(value: 'cancel_all', child: Text('Cancel All')),
+              PopupMenuDivider(),
+              PopupMenuItem(value: 'clear_completed', child: Text('Clear Completed')),
+            ],
           ),
         ],
       ),
@@ -253,34 +354,119 @@ class _MyAppState extends State<MyApp> {
             child: Column(
               children: [
                 TextField(
-                  controller: _urlController,
+                  controller: _urlsController,
                   decoration: InputDecoration(
-                    labelText: 'Download URL',
-                    hintText: 'Enter the URL to download',
+                    labelText: 'Download URLs (one per line)',
+                    hintText: 'Enter URLs separated by new lines',
                     border: OutlineInputBorder(),
                     suffixIcon: IconButton(
                       icon: Icon(Icons.clear),
-                      onPressed: () => _urlController.clear(),
+                      onPressed: () => _urlsController.clear(),
                     ),
                   ),
-                  maxLines: 2,
-                  minLines: 1,
+                  maxLines: 5,
+                  minLines: 3,
                 ),
                 SizedBox(height: 12),
-                SizedBox(
-                  width: double.infinity,
-                  child: ElevatedButton.icon(
-                    onPressed: startDownload,
-                    icon: Icon(Icons.download),
-                    label: Text('Start Download'),
-                    style: ElevatedButton.styleFrom(
-                      padding: EdgeInsets.symmetric(vertical: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      flex: 3,
+                      child: TextField(
+                        controller: _maxTasksController,
+                        decoration: InputDecoration(
+                          labelText: 'Max Concurrent Tasks',
+                          border: OutlineInputBorder(),
+                        ),
+                        keyboardType: TextInputType.number,
+                      ),
                     ),
-                  ),
+                    SizedBox(width: 12),
+                    Expanded(
+                      flex: 4,
+                      child: ElevatedButton.icon(
+                        onPressed: startBatchDownload,
+                        icon: Icon(Icons.download),
+                        label: Text('Start Downloads'),
+                        style: ElevatedButton.styleFrom(
+                          padding: EdgeInsets.symmetric(vertical: 16),
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
               ],
             ),
           ),
+
+          // Batch Progress Section
+          if (batchProgress != null) ...[
+            Container(
+              margin: EdgeInsets.symmetric(horizontal: 16),
+              padding: EdgeInsets.all(16),
+              decoration: BoxDecoration(
+                color: Colors.blue[50],
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.blue[200]!),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(
+                        'Overall Progress',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 16,
+                        ),
+                      ),
+                      Text(
+                        '${batchProgress!.completedDownloads}/${batchProgress!.totalDownloads}',
+                        style: TextStyle(
+                          color: Colors.blue[700],
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ],
+                  ),
+                  SizedBox(height: 8),
+                  LinearProgressIndicator(
+                    value: batchProgress!.overallProgress / 100.0,
+                    backgroundColor: Colors.grey[300],
+                    valueColor: AlwaysStoppedAnimation<Color>(Colors.blue),
+                  ),
+                  SizedBox(height: 8),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(
+                        '${batchProgress!.overallProgress}%',
+                        style: TextStyle(fontWeight: FontWeight.w500),
+                      ),
+                      if (batchProgress!.averageSpeed > 0)
+                        Text(
+                          '${_formatBytes(batchProgress!.averageSpeed.toInt())}/s',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Colors.blue[700],
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                    ],
+                  ),
+                  SizedBox(height: 4),
+                  Text(
+                    '${_formatBytes(batchProgress!.totalBytesDownloaded)} / ${_formatBytes(batchProgress!.totalBytes)}',
+                    style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+                  ),
+                ],
+              ),
+            ),
+            SizedBox(height: 8),
+          ],
+
           Divider(),
 
           // Downloads List
@@ -298,8 +484,9 @@ class _MyAppState extends State<MyApp> {
                   ),
                   SizedBox(height: 8),
                   Text(
-                    'Enter a URL above and tap "Start Download"',
+                    'Enter URLs above and tap "Start Downloads"',
                     style: TextStyle(color: Colors.grey),
+                    textAlign: TextAlign.center,
                   ),
                 ],
               ),
@@ -314,6 +501,66 @@ class _MyAppState extends State<MyApp> {
           ),
         ],
       ),
+
+      // Floating Action Button for batch operations
+      floatingActionButton: downloads.isNotEmpty ? FloatingActionButton(
+        onPressed: () {
+          showModalBottomSheet(
+            context: context,
+            builder: (context) => Container(
+              padding: EdgeInsets.all(16),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    'Batch Operations',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                  SizedBox(height: 16),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: ElevatedButton.icon(
+                          onPressed: _isBatchOperationInProgress ? null : _pauseAllDownloads,
+                          icon: _isBatchOperationInProgress
+                              ? SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                              : Icon(Icons.pause),
+                          label: Text('Pause All'),
+                          style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
+                        ),
+                      ),
+                      SizedBox(width: 8),
+                      Expanded(
+                        child: ElevatedButton.icon(
+                          onPressed: _isBatchOperationInProgress ? null : _resumeAllDownloads,
+                          icon: _isBatchOperationInProgress
+                              ? SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                              : Icon(Icons.play_arrow),
+                          label: Text('Resume All'),
+                          style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
+                        ),
+                      ),
+                    ],
+                  ),
+                  SizedBox(height: 8),
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton.icon(
+                      onPressed: _isBatchOperationInProgress ? null : _cancelAllDownloads,
+                      icon: _isBatchOperationInProgress
+                          ? SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                          : Icon(Icons.cancel),
+                      label: Text('Cancel All'),
+                      style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+        child: Icon(Icons.more_vert),
+      ) : null,
     );
   }
 
@@ -420,7 +667,7 @@ class _MyAppState extends State<MyApp> {
             ),
 
             // Error message
-            if (download.error != null) ...[
+            if (download.error != null && download.error!.isNotEmpty) ...[
               SizedBox(height: 8),
               Container(
                 padding: EdgeInsets.all(8),
@@ -616,7 +863,8 @@ class _MyAppState extends State<MyApp> {
 
   @override
   void dispose() {
-    _urlController.dispose();
+    _urlsController.dispose();
+    _maxTasksController.dispose();
     super.dispose();
   }
 }

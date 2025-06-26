@@ -16,21 +16,19 @@ class MultithreadedDownloads {
   }
 
   static Future<bool> startDownload({
-    required String url,
+    required List<String> urls,
     required String filePath,
     Map<String, String>? headers,
     int maxConcurrentTasks = 4,
-    int chunkSize = 1024 * 1024, // 1MB chunks
     int retryCount = 3,
     int timeoutSeconds = 30,
   }) async {
     try {
       final result = await _channel.invokeMethod('startDownload', {
-        'url': url,
+        'urls': urls,
         'filePath': filePath,
         'headers': headers ?? {},
         'maxConcurrentTasks': maxConcurrentTasks,
-        'chunkSize': chunkSize,
         'retryCount': retryCount,
         'timeoutSeconds': timeoutSeconds,
       });
@@ -67,12 +65,76 @@ class MultithreadedDownloads {
     }
   }
 
+  // Batch operations for multiple URLs
+  static Future<bool> pauseAllDownloads() async {
+    try {
+      final result = await _channel.invokeMethod('pauseAllDownloads');
+      return result == true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  static Future<bool> resumeAllDownloads() async {
+    try {
+      final result = await _channel.invokeMethod('resumeAllDownloads');
+      return result == true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  static Future<bool> cancelAllDownloads() async {
+    try {
+      final result = await _channel.invokeMethod('cancelAllDownloads');
+      return result == true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  static Future<bool> pauseDownloads(List<String> urls) async {
+    try {
+      final result = await _channel.invokeMethod('pauseDownloads', {'urls': urls});
+      return result == true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  static Future<bool> resumeDownloads(List<String> urls) async {
+    try {
+      final result = await _channel.invokeMethod('resumeDownloads', {'urls': urls});
+      return result == true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  static Future<bool> cancelDownloads(List<String> urls) async {
+    try {
+      final result = await _channel.invokeMethod('cancelDownloads', {'urls': urls});
+      return result == true;
+    } catch (e) {
+      return false;
+    }
+  }
+
   static Future<Map<String, dynamic>?> getDownloadStatus(String url) async {
     try {
       final result = await _channel.invokeMethod('getDownloadStatus', {'url': url});
       return Map<String, dynamic>.from(result);
     } catch (e) {
       return null;
+    }
+  }
+
+  static Future<List<Map<String, dynamic>>> getDownloadStatuses(List<String> urls) async {
+    try {
+      final result = await _channel.invokeMethod('getDownloadStatuses', {'urls': urls});
+      return List<Map<String, dynamic>>.from(result);
+    } catch (e) {
+      return [];
     }
   }
 
@@ -93,17 +155,27 @@ class MultithreadedDownloads {
       return false;
     }
   }
+
+  // Get overall progress for batch downloads
+  static Future<BatchDownloadProgress?> getBatchProgress() async {
+    try {
+      final result = await _channel.invokeMethod('getBatchProgress');
+      return BatchDownloadProgress.fromMap(Map<String, dynamic>.from(result));
+    } catch (e) {
+      return null;
+    }
+  }
 }
 
 class DownloadProgress {
-   String url;
-   String filePath;
-   int progress;
-   int bytesDownloaded;
-   int totalBytes;
-  DownloadStatus status;
-   String? error;
-   double speed;
+  final String url;
+  final String filePath;
+  final int progress;
+  final int bytesDownloaded;
+  final int totalBytes;
+  late final DownloadStatus status;
+  final String? error;
+  final double speed;
 
   DownloadProgress({
     required this.url,
@@ -126,6 +198,56 @@ class DownloadProgress {
       status: DownloadStatus.values[map['status'] ?? 0],
       error: map['error'],
       speed: (map['speed'] ?? 0.0).toDouble(),
+    );
+  }
+
+  Map<String, dynamic> toMap() {
+    return {
+      'url': url,
+      'filePath': filePath,
+      'progress': progress,
+      'bytesDownloaded': bytesDownloaded,
+      'totalBytes': totalBytes,
+      'status': status.index,
+      'error': error,
+      'speed': speed,
+    };
+  }
+}
+
+class BatchDownloadProgress {
+  final List<String> urls;
+  final int overallProgress;
+  final int totalBytesDownloaded;
+  final int totalBytes;
+  final int completedDownloads;
+  final int totalDownloads;
+  final double averageSpeed;
+  final List<DownloadProgress> individualProgress;
+
+  BatchDownloadProgress({
+    required this.urls,
+    required this.overallProgress,
+    required this.totalBytesDownloaded,
+    required this.totalBytes,
+    required this.completedDownloads,
+    required this.totalDownloads,
+    required this.averageSpeed,
+    required this.individualProgress,
+  });
+
+  factory BatchDownloadProgress.fromMap(Map<String, dynamic> map) {
+    return BatchDownloadProgress(
+      urls: List<String>.from(map['urls'] ?? []),
+      overallProgress: map['overallProgress'] ?? 0,
+      totalBytesDownloaded: map['totalBytesDownloaded'] ?? 0,
+      totalBytes: map['totalBytes'] ?? 0,
+      completedDownloads: map['completedDownloads'] ?? 0,
+      totalDownloads: map['totalDownloads'] ?? 0,
+      averageSpeed: (map['averageSpeed'] ?? 0.0).toDouble(),
+      individualProgress: (map['individualProgress'] as List<dynamic>? ?? [])
+          .map((item) => DownloadProgress.fromMap(Map<String, dynamic>.from(item)))
+          .toList(),
     );
   }
 }
