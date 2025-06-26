@@ -15,6 +15,8 @@ class MultithreadedDownloads {
     return _progressStream!;
   }
 
+  // ==================== Regular HTTP Downloads ====================
+
   static Future<bool> startDownload({
     required List<String> urls,
     required String filePath,
@@ -165,6 +167,162 @@ class MultithreadedDownloads {
       return null;
     }
   }
+
+  // ==================== M3U8/HLS Downloads ====================
+
+  /// Start downloading an M3U8/HLS stream
+  ///
+  /// [url] - The M3U8 playlist URL
+  /// [filePath] - Local file path where the video will be saved
+  /// [headers] - Optional HTTP headers for authentication or other purposes
+  static Future<bool> startM3u8Download({
+    required String url,
+    required String filePath,
+    Map<String, String>? headers,
+  }) async {
+    try {
+      final result = await _channel.invokeMethod('startM3u8Download', {
+        'url': url,
+        'filePath': filePath,
+        'headers': headers ?? {},
+      });
+      return result == true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /// Pause an M3U8 download
+  static Future<bool> pauseM3u8Download(String url) async {
+    try {
+      final result = await _channel.invokeMethod('pauseM3u8Download', {'url': url});
+      return result == true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /// Resume a paused M3U8 download
+  static Future<bool> resumeM3u8Download(String url) async {
+    try {
+      final result = await _channel.invokeMethod('resumeM3u8Download', {'url': url});
+      return result == true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /// Cancel an M3U8 download
+  static Future<bool> cancelM3u8Download(String url) async {
+    try {
+      final result = await _channel.invokeMethod('cancelM3u8Download', {'url': url});
+      return result == true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /// Get the status of a specific M3U8 download
+  static Future<Map<String, dynamic>?> getM3u8DownloadStatus(String url) async {
+    try {
+      final result = await _channel.invokeMethod('getM3u8DownloadStatus', {'url': url});
+      return result != null ? Map<String, dynamic>.from(result) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /// Get all M3U8 downloads
+  static Future<List<Map<String, dynamic>>> getAllM3u8Downloads() async {
+    try {
+      final result = await _channel.invokeMethod('getAllM3u8Downloads');
+      return List<Map<String, dynamic>>.from(result);
+    } catch (e) {
+      return [];
+    }
+  }
+
+  /// Clear all completed M3U8 downloads from the manager
+  static Future<bool> clearCompletedM3u8Downloads() async {
+    try {
+      final result = await _channel.invokeMethod('clearCompletedM3u8Downloads');
+      return result == true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // ==================== Convenience Methods ====================
+
+  /// Check if a URL is an M3U8 playlist
+  static bool isM3u8Url(String url) {
+    return url.toLowerCase().contains('.m3u8') || url.toLowerCase().contains('m3u8');
+  }
+
+  /// Start download with automatic detection of file type
+  /// Will use M3U8 downloader for .m3u8 URLs, regular downloader for others
+  static Future<bool> startSmartDownload({
+    required String url,
+    required String filePath,
+    Map<String, String>? headers,
+    // Regular download parameters (ignored for M3U8)
+    int maxConcurrentTasks = 4,
+    int retryCount = 3,
+    int timeoutSeconds = 30,
+  }) async {
+    if (isM3u8Url(url)) {
+      return startM3u8Download(
+        url: url,
+        filePath: filePath,
+        headers: headers,
+      );
+    } else {
+      return startDownload(
+        urls: [url],
+        filePath: filePath,
+        headers: headers,
+        maxConcurrentTasks: maxConcurrentTasks,
+        retryCount: retryCount,
+        timeoutSeconds: timeoutSeconds,
+      );
+    }
+  }
+
+  /// Pause download with automatic detection of file type
+  static Future<bool> pauseSmartDownload(String url) async {
+    if (isM3u8Url(url)) {
+      return pauseM3u8Download(url);
+    } else {
+      return pauseDownload(url);
+    }
+  }
+
+  /// Resume download with automatic detection of file type
+  static Future<bool> resumeSmartDownload(String url) async {
+    if (isM3u8Url(url)) {
+      return resumeM3u8Download(url);
+    } else {
+      return resumeDownload(url);
+    }
+  }
+
+  /// Cancel download with automatic detection of file type
+  static Future<bool> cancelSmartDownload(String url) async {
+    if (isM3u8Url(url)) {
+      return cancelM3u8Download(url);
+    } else {
+      return cancelDownload(url);
+    }
+  }
+
+  /// Get download status with automatic detection of file type
+  static Future<Map<String, dynamic>?> getSmartDownloadStatus(String url) async {
+    if (isM3u8Url(url)) {
+      return getM3u8DownloadStatus(url);
+    } else {
+      return getDownloadStatus(url);
+    }
+  }
 }
 
 class DownloadProgress {
@@ -176,6 +334,7 @@ class DownloadProgress {
   late final DownloadStatus status;
   final String? error;
   final double speed;
+  final DownloadType type;
 
   DownloadProgress({
     required this.url,
@@ -186,6 +345,7 @@ class DownloadProgress {
     required this.status,
     this.error,
     required this.speed,
+    this.type = DownloadType.regular,
   });
 
   factory DownloadProgress.fromMap(Map<String, dynamic> map) {
@@ -198,6 +358,11 @@ class DownloadProgress {
       status: DownloadStatus.values[map['status'] ?? 0],
       error: map['error'],
       speed: (map['speed'] ?? 0.0).toDouble(),
+      type: map['type'] != null
+          ? DownloadType.values[map['type']]
+          : (MultithreadedDownloads.isM3u8Url(map['url'] ?? '')
+          ? DownloadType.m3u8
+          : DownloadType.regular),
     );
   }
 
@@ -211,8 +376,55 @@ class DownloadProgress {
       'status': status.index,
       'error': error,
       'speed': speed,
+      'type': type.index,
     };
   }
+
+  /// Format speed in human readable format
+  String get formattedSpeed {
+    if (speed < 1024) {
+      return '${speed.toStringAsFixed(1)} B/s';
+    } else if (speed < 1024 * 1024) {
+      return '${(speed / 1024).toStringAsFixed(1)} KB/s';
+    } else {
+      return '${(speed / (1024 * 1024)).toStringAsFixed(1)} MB/s';
+    }
+  }
+
+  /// Format bytes in human readable format
+  String get formattedSize {
+    return _formatBytes(bytesDownloaded) + ' / ' + _formatBytes(totalBytes);
+  }
+
+  String _formatBytes(int bytes) {
+    if (bytes < 1024) {
+      return '$bytes B';
+    } else if (bytes < 1024 * 1024) {
+      return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    } else if (bytes < 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    } else {
+      return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
+    }
+  }
+
+  /// Check if download is in progress
+  bool get isInProgress => status == DownloadStatus.downloading;
+
+  /// Check if download is completed
+  bool get isCompleted => status == DownloadStatus.completed;
+
+  /// Check if download is paused
+  bool get isPaused => status == DownloadStatus.paused;
+
+  /// Check if download has failed
+  bool get hasFailed => status == DownloadStatus.failed;
+
+  /// Check if download is cancelled
+  bool get isCancelled => status == DownloadStatus.cancelled;
+
+  /// Check if download is M3U8/HLS type
+  bool get isM3u8 => type == DownloadType.m3u8;
 }
 
 class BatchDownloadProgress {
@@ -250,6 +462,26 @@ class BatchDownloadProgress {
           .toList(),
     );
   }
+
+  /// Format average speed in human readable format
+  String get formattedAverageSpeed {
+    if (averageSpeed < 1024) {
+      return '${averageSpeed.toStringAsFixed(1)} B/s';
+    } else if (averageSpeed < 1024 * 1024) {
+      return '${(averageSpeed / 1024).toStringAsFixed(1)} KB/s';
+    } else {
+      return '${(averageSpeed / (1024 * 1024)).toStringAsFixed(1)} MB/s';
+    }
+  }
+
+  /// Get progress percentage as double (0.0 to 1.0)
+  double get progressPercentage => overallProgress / 100.0;
+
+  /// Check if all downloads are completed
+  bool get isAllCompleted => completedDownloads == totalDownloads;
+
+  /// Get remaining downloads count
+  int get remainingDownloads => totalDownloads - completedDownloads;
 }
 
 enum DownloadStatus {
@@ -259,4 +491,9 @@ enum DownloadStatus {
   completed,
   failed,
   cancelled,
+}
+
+enum DownloadType {
+  regular,
+  m3u8,
 }
