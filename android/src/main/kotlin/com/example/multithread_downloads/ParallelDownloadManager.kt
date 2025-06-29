@@ -13,7 +13,7 @@ class ParallelDownloadManager {
     private var batchJob: Job? = null
 
     private val httpsDownloader = HttpsDownloader()
-    private val hlsDownloader = HlsDownloader()
+    private val hlsDownloader = HighPerformanceHlsDownloader()
 
     fun startBatchDownload(
         urls: List<String>,
@@ -42,7 +42,7 @@ class ParallelDownloadManager {
                         downloads[url]?.let { task ->
                             try {
                                 if (task.url.endsWith(".m3u8", ignoreCase = true)) {
-                                    hlsDownloader.downloadHlsStreamOptimized(task, basePath, onProgress)
+                                    hlsDownloader.downloadHlsStreamAdvanced(task, basePath, onProgress)
                                 } else {
                                     httpsDownloader.downloadSingleFile(task, onProgress)
                                 }
@@ -128,7 +128,7 @@ class ParallelDownloadManager {
                     try {
                         if (task.url.endsWith(".m3u8", ignoreCase = true)) {
                             val basePath = File(task.filePath).parent ?: ""
-                            hlsDownloader.downloadHlsStreamOptimized(task, basePath, onProgress)
+                            hlsDownloader.downloadHlsStreamAdvanced(task, basePath, onProgress)
                         } else {
                             httpsDownloader.downloadSingleFile(task, onProgress)
                         }
@@ -174,7 +174,7 @@ class ParallelDownloadManager {
                     try {
                         if (task.url.endsWith(".m3u8", ignoreCase = true)) {
                             val basePath = File(task.filePath).parent ?: ""
-                            hlsDownloader.downloadHlsStreamOptimized(task, basePath, onProgress)
+                            hlsDownloader.downloadHlsStreamAdvanced(task, basePath, onProgress)
                         } else {
                             httpsDownloader.downloadSingleFile(task, onProgress)
                         }
@@ -222,7 +222,7 @@ class ParallelDownloadManager {
                         try {
                             if (task.url.endsWith(".m3u8", ignoreCase = true)) {
                                 val basePath = File(task.filePath).parent ?: ""
-                                hlsDownloader.downloadHlsStreamOptimized(task, basePath, onProgress)
+                                hlsDownloader.downloadHlsStreamAdvanced(task, basePath, onProgress)
                             } else {
                                 httpsDownloader.downloadSingleFile(task, onProgress)
                             }

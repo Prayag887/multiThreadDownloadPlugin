@@ -24,11 +24,12 @@ class _MyAppState extends State<MyApp> {
   List<DownloadProgress> downloads = [];
   BetterPlayerController? _playerController;
   final List<String> _defaultUrls = [
+    'https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/master.m3u8',
     'https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tears-of-steel.ism/.m3u8',
   ];
   final TextEditingController _urlsController = TextEditingController();
   int _downloadCounter = 1;
-  MultithreadedDownloads _multithreadedDownloads = MultithreadedDownloads();
+  final MultithreadedDownloads _multithreadedDownloads = MultithreadedDownloads();
 
   @override
   void initState() {
@@ -122,7 +123,7 @@ class _MyAppState extends State<MyApp> {
         await MultithreadedDownloads.startDownload(
           urls: [urls[i]],
           filePath: safeFilePath,
-          maxConcurrentTasks: 4,
+          maxConcurrentTasks: 50,
           retryCount: 3,
           timeoutSeconds: 30,
         );

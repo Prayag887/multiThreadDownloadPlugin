@@ -28,12 +28,14 @@ data class SegmentTask(
     val fileName: String,
     val size: Long = 0,
     var downloaded: Boolean = false,
-    var bytes: Long = 0
+    var bytes: Long = 0,
+    val duration: Double = 10.0
 )
 
 data class VariantPlaylist(
     val url: String,
     val fileName: String,
     val bandwidth: Long = 0,
-    val segments: MutableList<SegmentTask> = mutableListOf()
+//    val segments: MutableList<SegmentTask> = mutableListOf(),
+    val resolution: String = ""
 )

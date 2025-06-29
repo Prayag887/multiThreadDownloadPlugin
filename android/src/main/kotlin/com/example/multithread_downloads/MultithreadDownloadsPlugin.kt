@@ -28,12 +28,13 @@ class MultithreadDownloadsPlugin: FlutterPlugin, MethodCallHandler, EventChannel
   override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: Result) {
     when (call.method) {
       "startDownload" -> {
+        println("headers::: ${call.argument<Map<String, String>>("headers") ?: emptyMap()}")
         val urls = call.argument<List<String>>("urls") ?: emptyList()
         downloadManager.startBatchDownload(
           urls,
           call.argument<String>("filePath")!!,
           call.argument<Map<String, String>>("headers") ?: emptyMap(),
-          call.argument<Int>("maxConcurrentTasks") ?: 8,
+          call.argument<Int>("maxConcurrentTasks") ?: 50,
           call.argument<Int>("retryCount") ?: 3,
           call.argument<Int>("timeoutSeconds") ?: 30
         ) {
