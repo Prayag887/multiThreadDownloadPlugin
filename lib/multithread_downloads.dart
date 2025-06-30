@@ -209,6 +209,10 @@ class MultithreadedDownloads {
       return null;
     }
   }
+
+  static cleanUpM3U8() async {
+    await _channel.invokeMethod<String>('cleanUp');
+  }
 }
 
 class DownloadProgress {

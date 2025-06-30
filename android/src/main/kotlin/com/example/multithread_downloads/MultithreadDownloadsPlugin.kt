@@ -27,6 +27,7 @@ class MultithreadDownloadsPlugin: FlutterPlugin, MethodCallHandler, EventChannel
 
   override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: Result) {
     when (call.method) {
+      "cleanUp" -> {downloadManager.cleanUp();}
       "startDownload" -> {
         println("headers::: ${call.argument<Map<String, String>>("headers") ?: emptyMap()}")
         val urls = call.argument<List<String>>("urls") ?: emptyList()

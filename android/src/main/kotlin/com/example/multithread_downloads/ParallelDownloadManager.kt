@@ -15,6 +15,10 @@ class ParallelDownloadManager {
     private val httpsDownloader = HttpsDownloader()
     private val hlsDownloader = HighPerformanceHlsDownloader()
 
+    fun cleanUp() {
+       hlsDownloader.cleanUp()
+    }
+
     fun startBatchDownload(
         urls: List<String>,
         basePath: String,
