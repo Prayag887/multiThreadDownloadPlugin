@@ -20,7 +20,7 @@ data class DownloadTask(
 )
 
 enum class DownloadStatus(val value: Int) {
-    PENDING(0), DOWNLOADING(1), PAUSED(2), COMPLETED(3), FAILED(4), CANCELLED(5)
+    PENDING(0), DOWNLOADING(1), PAUSED(2), COMPLETED(3), FAILED(4), CANCELLED(5), INITIALIZING(6)
 }
 
 data class SegmentTask(

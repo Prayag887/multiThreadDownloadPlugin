@@ -316,14 +316,49 @@ class HighPerformanceHlsDownloader {
 
         val masterContent = fetchPlaylistContent(masterUrl, headers)
         val variants = parseMasterPlaylist(masterContent, baseUri)
-
-        // Sample segments from the highest quality variant for size estimation
-        val primaryVariant = variants.firstOrNull() ?: throw IOException("No variants found")
-        val sampleSegments = getSampleSegments(primaryVariant, baseUri, headers, 5)
-        val avgSegmentSize = estimateSegmentSizeAdvanced(sampleSegments, headers)
+//        val avgSegmentSize = estimateSegmentSizeAdvanced(sampleSegments, headers)
+        val avgSegmentSize = 500_000L
 
         return Pair(variants, avgSegmentSize)
     }
+
+
+//    Below is the safer approach but its slower for parsing:
+
+//    private suspend fun analyzeHlsStream(
+//        masterUrl: String,
+//        headers: Map<String, String>,
+//        baseUri: HttpUrl
+//    ): Pair<List<VariantPlaylist>, Long> {
+//
+//        val masterContent = fetchPlaylistContent(masterUrl, headers)
+//        val variants = parseMasterPlaylist(masterContent, baseUri)
+//
+//        // Sample segments from the highest quality variant for size estimation
+//        val primaryVariant = variants.firstOrNull() ?: throw IOException("No variants found")
+//        val sampleSegments = getSampleSegments(primaryVariant, baseUri, headers, 5)
+//        val avgSegmentSize = estimateSegmentSizeAdvanced(sampleSegments, headers)
+//
+//        return Pair(variants, avgSegmentSize)
+//    }
+
+
+    private suspend fun analyzeHlsStream(...): Pair<List<VariantPlaylist>, Long> = coroutineScope {
+
+        val masterContent = fetchPlaylistContent(masterUrl, headers)
+        val variants = parseMasterPlaylist(masterContent, baseUri)
+
+        // Start size estimation in parallel, don't wait for it
+        val sizeEstimationJob = async {
+            // Your existing size estimation logic
+        }
+
+        // Use default size initially, update config later if needed
+        val defaultSize = 300_000L
+
+        return@coroutineScope Pair(variants, defaultSize)
+    }
+
 
     /**
      * Processes variant playlist and creates prioritized segment tasks
@@ -577,20 +612,20 @@ class HighPerformanceHlsDownloader {
         }
     }
 
-    private suspend fun estimateSegmentSizeAdvanced(
-        sampleSegments: List<SegmentTask>,
-        headers: Map<String, String>
-    ): Long {
-        if (sampleSegments.isEmpty()) return 200_000L
-
-        val sizes = sampleSegments.mapNotNull { segment ->
-            getContentLength(segment.url, headers)
-        }
-
-        return if (sizes.isNotEmpty()) {
-            sizes.average().toLong()
-        } else 200_000L
-    }
+//    private suspend fun estimateSegmentSizeAdvanced(
+//        sampleSegments: List<SegmentTask>,
+//        headers: Map<String, String>
+//    ): Long {
+//        if (sampleSegments.isEmpty()) return 200_000L
+//
+//        val sizes = sampleSegments.mapNotNull { segment ->
+//            getContentLength(segment.url, headers)
+//        }
+//
+//        return if (sizes.isNotEmpty()) {
+//            sizes.average().toLong()
+//        } else 200_000L
+//    }
 
     // Reuse existing helper functions from original code
     private suspend fun fetchPlaylistContent(url: String, headers: Map<String, String>): String {
