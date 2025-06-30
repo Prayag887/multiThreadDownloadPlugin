@@ -322,9 +322,6 @@ class HighPerformanceHlsDownloader {
         return Pair(variants, avgSegmentSize)
     }
 
-
-//    Below is the safer approach but its slower for parsing:
-
 //    private suspend fun analyzeHlsStream(
 //        masterUrl: String,
 //        headers: Map<String, String>,
@@ -341,24 +338,6 @@ class HighPerformanceHlsDownloader {
 //
 //        return Pair(variants, avgSegmentSize)
 //    }
-
-
-    private suspend fun analyzeHlsStream(...): Pair<List<VariantPlaylist>, Long> = coroutineScope {
-
-        val masterContent = fetchPlaylistContent(masterUrl, headers)
-        val variants = parseMasterPlaylist(masterContent, baseUri)
-
-        // Start size estimation in parallel, don't wait for it
-        val sizeEstimationJob = async {
-            // Your existing size estimation logic
-        }
-
-        // Use default size initially, update config later if needed
-        val defaultSize = 300_000L
-
-        return@coroutineScope Pair(variants, defaultSize)
-    }
-
 
     /**
      * Processes variant playlist and creates prioritized segment tasks
