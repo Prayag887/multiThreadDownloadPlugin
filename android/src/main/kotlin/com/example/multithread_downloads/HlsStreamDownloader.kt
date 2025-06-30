@@ -341,7 +341,8 @@ class HighPerformanceHlsDownloader {
             println("Processing variant: ${variant.url}")
             val variantContent = fetchPlaylistContent(variant.url, headers)
             println("Variant content length: ${variantContent.length}")
-            val segments = parseVariantPlaylist(variantContent, baseUri, variant.fileName)
+            val variantUri = variant.url.toHttpUrlOrNull()!!
+            val segments = parseVariantPlaylist(variantContent, variantUri, variant.fileName)
             println("Found ${segments.size} segments in variant")
             totalSegments.addAndGet(segments.size)
 

@@ -24,8 +24,7 @@ class _MyAppState extends State<MyApp> {
   List<DownloadProgress> downloads = [];
   BetterPlayerController? _playerController;
   final List<String> _defaultUrls = [
-    'https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/master.m3u8',
-    'https://demo.unified-streaming.com/k8s/features/stable/video/tears-of-steel/tears-of-steel.ism/.m3u8',
+  'https://vz-da43afc1-1ad.b-cdn.net/bcdn_token=aaW5LOkiSUCFZyisahJmYi6MJsbFLc87UBTj4HmeRZ0&expires=1751270441&token_path=%2F455d9f48-072a-4693-a86f-c624431e5789/455d9f48-072a-4693-a86f-c624431e5789/playlist.m3u8',
   ];
   final TextEditingController _urlsController = TextEditingController();
   int _downloadCounter = 1;
@@ -123,6 +122,11 @@ class _MyAppState extends State<MyApp> {
         await MultithreadedDownloads.startDownload(
           urls: [urls[i]],
           filePath: safeFilePath,
+          headers: {
+            "Authorization": "Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJhdWQiOiIxIiwianRpIjoiMWQ3YmY2Yjc1ODk3OGJkODg1NDU3NTI3MmQxMGNhMzJiNTM5ZDQ0YWM4YzhlMzFlMDc5YTM0MzU4MDJlZDFiNzQwYWE2NGExNzgyMzI3ZTIiLCJpYXQiOjE3NTEyMDkzODMuNTYzMDA2LCJuYmYiOjE3NTEyMDkzODMuNTYzMDA5LCJleHAiOjE3ODIzMTMzODMuNTU4MjY1LCJzdWIiOiIxOTQzODYiLCJzY29wZXMiOlsiY3VzdG9tZXJzIl19.FWzAPbu5VNQ0JNNwpaFmeECPdP_LB5RR2dwMPWNhRfqtujnsLuMwlZd3ysPyxjvCPXm2YXYRub4_6eJjwYtyqmbYIqE_dpDKW2KJjS1ypd488V9nS1-plCDeRYjSshk8mEc8_xwjdMcwV-HIC-xIHvHSXvywY16KrPKgfOEZj2icNDW1MUXMTFq5mFRxDo-YdCumJJnLmSLk2r9zXBrvjZUsHSS3uDHSWBFE2njCW1R3AYlu-cgi8-rtQaFocsmCgcW8bRwfrqDjKoSBjgK1DWS3k4SinTUipfiAl_AsYU-TcPhRKXY0ZN_aZIXhfSKJH2GBiNsvA1oB6Ow9NF7xIDOj3QnA6ELYLj_l2lg59Zzl4raPqHXu9ExkI7Bt1fMY0WQo1rmYU2VBJiIpnloRd4RgBObolbt3DEnnP_CZpFAa39sbT8fwZwTB8DWsCUUgptOqtb-1bIEGdrkzMjYZkVhADca2Ztkyl7XeEyZY-BQ6UDcbENlisa86uIYtLO9ZzGJb-v6PCRbLkxqrVw7EAyrUYlVCumRhe9cSjdXwGfA4gPJrCpHCDKrEn4ujo_1K8w6nGItlccmsHj_QaJOcFPbzEhAENua3JXF4gJtwtvfHC6bKgxzVG4Gc4J_l1GrgVmaptp1m2nuISYGSeX8a5B9nLxQR2KDS8dJYZuPdj5k",
+            "fingerprint": "2985b43a82712cb9",
+            "referer": "https://app.ambition.guru/"
+          },
           maxConcurrentTasks: 50,
           retryCount: 3,
           timeoutSeconds: 30,
