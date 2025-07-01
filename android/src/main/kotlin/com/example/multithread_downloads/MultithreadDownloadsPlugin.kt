@@ -18,6 +18,19 @@ class MultithreadDownloadsPlugin: FlutterPlugin, MethodCallHandler, EventChannel
   private val mainHandler = Handler(Looper.getMainLooper())
   private val downloadManager = ParallelDownloadManager()
 
+  // Queue to store pending download requests
+  private val downloadQueue = ArrayDeque<DownloadRequest>()
+  private var isProcessingQueue = false
+
+  data class DownloadRequest(
+    val urls: List<String>,
+    val filePath: String,
+    val headers: Map<String, String>,
+    val maxConcurrentTasks: Int,
+    val retryCount: Int,
+    val timeoutSeconds: Int
+  )
+
   override fun onAttachedToEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
     channel = MethodChannel(binding.binaryMessenger, "multithread_downloads")
     eventChannel = EventChannel(binding.binaryMessenger, "multithread_downloads/progress")
@@ -30,16 +43,20 @@ class MultithreadDownloadsPlugin: FlutterPlugin, MethodCallHandler, EventChannel
       "startDownload" -> {
         println("headers::: ${call.argument<Map<String, String>>("headers") ?: emptyMap()}")
         val urls = call.argument<List<String>>("urls") ?: emptyList()
-        downloadManager.startBatchDownload(
-          urls,
-          call.argument<String>("filePath")!!,
-          call.argument<Map<String, String>>("headers") ?: emptyMap(),
-          call.argument<Int>("maxConcurrentTasks") ?: 50,
-          call.argument<Int>("retryCount") ?: 3,
-          call.argument<Int>("timeoutSeconds") ?: 30
-        ) {
-          sendProgress(it)
-        }
+        val filePath = call.argument<String>("filePath")!!
+        val headers = call.argument<Map<String, String>>("headers") ?: emptyMap()
+        val maxConcurrentTasks = call.argument<Int>("maxConcurrentTasks") ?: 50
+        val retryCount = call.argument<Int>("retryCount") ?: 3
+        val timeoutSeconds = call.argument<Int>("timeoutSeconds") ?: 30
+
+        val downloadRequest = DownloadRequest(
+          urls, filePath, headers, maxConcurrentTasks, retryCount, timeoutSeconds
+        )
+
+        // Add to queue and process
+        downloadQueue.offer(downloadRequest)
+        processDownloadQueue()
+
         result.success(true)
       }
       "pauseDownload" -> result.success(downloadManager.pauseDownload(call.argument<String>("url")!!))
@@ -54,7 +71,13 @@ class MultithreadDownloadsPlugin: FlutterPlugin, MethodCallHandler, EventChannel
         downloadManager.resumeAllDownloads() { sendProgress(it) }
         result.success(true)
       }
-      "cancelAllDownloads" -> result.success(downloadManager.cancelAllDownloads())
+      "cancelAllDownloads" -> {
+        val cancelled = downloadManager.cancelAllDownloads()
+        // Clear the queue when all downloads are cancelled
+        downloadQueue.clear()
+        isProcessingQueue = false
+        result.success(cancelled)
+      }
       "pauseDownloads" -> {
         val urls = call.argument<List<String>>("urls") ?: emptyList()
         result.success(downloadManager.pauseDownloads(urls))
@@ -76,8 +99,50 @@ class MultithreadDownloadsPlugin: FlutterPlugin, MethodCallHandler, EventChannel
       "getAllDownloads" -> result.success(downloadManager.getAllDownloads())
       "getBatchProgress" -> result.success(downloadManager.getBatchProgress())
       "clearCompletedDownloads" -> result.success(downloadManager.clearCompletedDownloads())
+      "getQueueSize" -> result.success(downloadQueue.size) // Optional: to check queue size
       else -> result.notImplemented()
     }
+  }
+
+  private fun processDownloadQueue() {
+    if (isProcessingQueue || downloadQueue.isEmpty()) {
+      return
+    }
+
+    isProcessingQueue = true
+    val request = downloadQueue.poll()
+
+    if (request != null) {
+      downloadManager.startBatchDownload(
+        request.urls,
+        request.filePath,
+        request.headers,
+        request.maxConcurrentTasks,
+        request.retryCount,
+        request.timeoutSeconds,
+        onProgress = { progress ->
+          sendProgress(progress)
+        },
+        onBatchComplete = {
+          // Batch completed, process next item in queue
+          isProcessingQueue = false
+          processDownloadQueue()
+        }
+      )
+    } else {
+      isProcessingQueue = false
+    }
+  }
+
+  private fun isBatchComplete(batchProgress: Map<String, Any>): Boolean {
+    // You'll need to implement this based on your ParallelDownloadManager's getBatchProgress() structure
+    // This is just an example - adjust according to your actual implementation
+    val totalFiles = batchProgress["totalFiles"] as? Int ?: 0
+    val completedFiles = batchProgress["completedFiles"] as? Int ?: 0
+    val failedFiles = batchProgress["failedFiles"] as? Int ?: 0
+    val cancelledFiles = batchProgress["cancelledFiles"] as? Int ?: 0
+
+    return (completedFiles + failedFiles + cancelledFiles) >= totalFiles
   }
 
   override fun onListen(arguments: Any?, events: EventChannel.EventSink?) { eventSink = events }
@@ -91,5 +156,7 @@ class MultithreadDownloadsPlugin: FlutterPlugin, MethodCallHandler, EventChannel
     channel.setMethodCallHandler(null)
     eventChannel.setStreamHandler(null)
     downloadManager.cancelAllDownloads()
+    downloadQueue.clear()
+    isProcessingQueue = false
   }
 }

@@ -12,6 +12,9 @@ class ParallelDownloadManager {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var batchJob: Job? = null
 
+    // Add batch completion callback
+    private var onBatchComplete: (() -> Unit)? = null
+
     private val httpsDownloader = HttpsDownloader()
     private val hlsDownloader = HighPerformanceHlsDownloader()
 
@@ -22,9 +25,13 @@ class ParallelDownloadManager {
         maxConcurrentTasks: Int,
         retryCount: Int,
         timeoutSeconds: Int,
-        onProgress: (Map<String, Any>) -> Unit
+        onProgress: (Map<String, Any>) -> Unit,
+        onBatchComplete: (() -> Unit)? = null // Add batch completion callback
     ) {
         batchJob?.cancel()
+
+        // Store the batch completion callback
+        this.onBatchComplete = onBatchComplete
 
         urls.forEach { url ->
             val fileName = extractFileName(url)
@@ -58,6 +65,32 @@ class ParallelDownloadManager {
 
             downloadJobs.awaitAll()
             sendBatchProgress(onProgress)
+
+            // Notify batch completion
+            this@ParallelDownloadManager.onBatchComplete?.invoke()
+            this@ParallelDownloadManager.onBatchComplete = null
+        }
+    }
+
+    // Add method to check if batch is complete
+    fun isBatchComplete(): Boolean {
+        if (downloads.isEmpty()) return true
+
+        val allTasks = downloads.values.toList()
+        val totalTasks = allTasks.size
+        val completedTasks = allTasks.count {
+            it.status == DownloadStatus.COMPLETED ||
+                    it.status == DownloadStatus.FAILED ||
+                    it.status == DownloadStatus.CANCELLED
+        }
+
+        return completedTasks >= totalTasks
+    }
+
+    // Add method to check if batch is actively downloading
+    fun isBatchActive(): Boolean {
+        return batchJob?.isActive == true && downloads.values.any {
+            it.status == DownloadStatus.DOWNLOADING || it.status == DownloadStatus.INITIALIZING
         }
     }
 
@@ -109,7 +142,7 @@ class ParallelDownloadManager {
         }
     }
 
-    // Control methods (pause, resume, cancel, etc.)
+    // Control methods (pause, resume, cancel, etc.) - mostly unchanged
     fun pauseDownload(url: String): Boolean {
         return downloads[url]?.let { task ->
             if (task.status == DownloadStatus.DOWNLOADING) {
@@ -190,6 +223,7 @@ class ParallelDownloadManager {
 
     fun cancelAllDownloads(): Boolean {
         batchJob?.cancel()
+        onBatchComplete = null // Clear the callback
         downloads.values.forEach { task ->
             task.status = DownloadStatus.CANCELLED
             task.job?.cancel()
@@ -199,6 +233,7 @@ class ParallelDownloadManager {
         return true
     }
 
+    // Rest of the methods remain the same...
     fun pauseDownloads(urls: List<String>): Boolean {
         var hasActive = false
         urls.forEach { url ->
@@ -289,6 +324,7 @@ class ParallelDownloadManager {
         val downloadedBytes = allTasks.sumOf { it.downloadedBytes }
         val completedCount = allTasks.count { it.status == DownloadStatus.COMPLETED }
         val failedCount = allTasks.count { it.status == DownloadStatus.FAILED }
+        val cancelledCount = allTasks.count { it.status == DownloadStatus.CANCELLED }
         val activeCount = allTasks.count { it.status == DownloadStatus.DOWNLOADING }
         val pausedCount = allTasks.count { it.status == DownloadStatus.PAUSED }
 
@@ -309,10 +345,12 @@ class ParallelDownloadManager {
             "totalBytes" to totalBytes,
             "completedDownloads" to completedCount,
             "failedDownloads" to failedCount,
+            "cancelledDownloads" to cancelledCount,
             "activeDownloads" to activeCount,
             "pausedDownloads" to pausedCount,
             "totalDownloads" to allTasks.size,
             "averageSpeed" to averageSpeed,
+            "isComplete" to isBatchComplete(), // Add this field
             "individualProgress" to allTasks.map { task ->
                 mapOf(
                     "url" to task.url,
