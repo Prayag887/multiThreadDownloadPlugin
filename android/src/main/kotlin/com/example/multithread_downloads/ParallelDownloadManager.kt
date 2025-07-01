@@ -26,9 +26,15 @@ class ParallelDownloadManager {
         retryCount: Int,
         timeoutSeconds: Int,
         onProgress: (Map<String, Any>) -> Unit,
-        onBatchComplete: (() -> Unit)? = null // Add batch completion callback
+        onBatchComplete: (() -> Unit)? = null
     ) {
+        // Cancel any existing batch
         batchJob?.cancel()
+
+        // Clear previous downloads if batch is complete or no active downloads
+        if (isReadyForNewBatch()) {
+            clearCompletedDownloads()
+        }
 
         // Store the batch completion callback
         this.onBatchComplete = onBatchComplete
@@ -72,7 +78,7 @@ class ParallelDownloadManager {
         }
     }
 
-    // Add method to check if batch is complete
+    // Check if batch is complete
     fun isBatchComplete(): Boolean {
         if (downloads.isEmpty()) return true
 
@@ -87,11 +93,22 @@ class ParallelDownloadManager {
         return completedTasks >= totalTasks
     }
 
-    // Add method to check if batch is actively downloading
-    fun isBatchActive(): Boolean {
-        return batchJob?.isActive == true && downloads.values.any {
+    // This function is now being used properly
+    fun isReadyForNewBatch(): Boolean {
+        val jobNotActive = batchJob?.isActive != true
+        val noActiveDownloads = downloads.values.none {
             it.status == DownloadStatus.DOWNLOADING || it.status == DownloadStatus.INITIALIZING
         }
+        return jobNotActive && (downloads.isEmpty() || (isBatchComplete() && noActiveDownloads))
+    }
+
+    // Check if batch is actively downloading
+    fun isBatchActive(): Boolean {
+        val jobActive = batchJob?.isActive == true
+        val hasActiveDownloads = downloads.values.any {
+            it.status == DownloadStatus.DOWNLOADING || it.status == DownloadStatus.INITIALIZING
+        }
+        return jobActive && hasActiveDownloads
     }
 
     private fun extractFileName(url: String): String {
@@ -142,7 +159,7 @@ class ParallelDownloadManager {
         }
     }
 
-    // Control methods (pause, resume, cancel, etc.) - mostly unchanged
+    // Rest of the methods remain the same...
     fun pauseDownload(url: String): Boolean {
         return downloads[url]?.let { task ->
             if (task.status == DownloadStatus.DOWNLOADING) {
@@ -223,7 +240,7 @@ class ParallelDownloadManager {
 
     fun cancelAllDownloads(): Boolean {
         batchJob?.cancel()
-        onBatchComplete = null // Clear the callback
+        onBatchComplete = null
         downloads.values.forEach { task ->
             task.status = DownloadStatus.CANCELLED
             task.job?.cancel()
@@ -233,7 +250,6 @@ class ParallelDownloadManager {
         return true
     }
 
-    // Rest of the methods remain the same...
     fun pauseDownloads(urls: List<String>): Boolean {
         var hasActive = false
         urls.forEach { url ->
@@ -350,7 +366,8 @@ class ParallelDownloadManager {
             "pausedDownloads" to pausedCount,
             "totalDownloads" to allTasks.size,
             "averageSpeed" to averageSpeed,
-            "isComplete" to isBatchComplete(), // Add this field
+            "isComplete" to isBatchComplete(),
+            "isReadyForNewBatch" to isReadyForNewBatch(),
             "individualProgress" to allTasks.map { task ->
                 mapOf(
                     "url" to task.url,

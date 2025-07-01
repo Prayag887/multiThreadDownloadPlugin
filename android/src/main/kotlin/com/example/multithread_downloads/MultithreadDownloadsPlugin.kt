@@ -10,6 +10,7 @@ import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
+import java.util.concurrent.ConcurrentLinkedQueue
 
 class MultithreadDownloadsPlugin: FlutterPlugin, MethodCallHandler, EventChannel.StreamHandler {
   private lateinit var channel: MethodChannel
@@ -18,8 +19,8 @@ class MultithreadDownloadsPlugin: FlutterPlugin, MethodCallHandler, EventChannel
   private val mainHandler = Handler(Looper.getMainLooper())
   private val downloadManager = ParallelDownloadManager()
 
-  // Queue to store pending download requests
-  private val downloadQueue = ArrayDeque<DownloadRequest>()
+  // Use ConcurrentLinkedQueue for thread safety
+  private val downloadQueue = ConcurrentLinkedQueue<DownloadRequest>()
   private var isProcessingQueue = false
 
   data class DownloadRequest(
@@ -28,7 +29,8 @@ class MultithreadDownloadsPlugin: FlutterPlugin, MethodCallHandler, EventChannel
     val headers: Map<String, String>,
     val maxConcurrentTasks: Int,
     val retryCount: Int,
-    val timeoutSeconds: Int
+    val timeoutSeconds: Int,
+    val requestId: String = System.currentTimeMillis().toString()
   )
 
   override fun onAttachedToEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
@@ -53,11 +55,21 @@ class MultithreadDownloadsPlugin: FlutterPlugin, MethodCallHandler, EventChannel
           urls, filePath, headers, maxConcurrentTasks, retryCount, timeoutSeconds
         )
 
-        // Add to queue and process
+        // Add to queue
         downloadQueue.offer(downloadRequest)
+        println("Added download request to queue. Queue size: ${downloadQueue.size}")
+
+        // Send queue status update
+        sendQueueStatus()
+
+        // Process queue
         processDownloadQueue()
 
-        result.success(true)
+        result.success(mapOf(
+          "success" to true,
+          "queueSize" to downloadQueue.size,
+          "isProcessing" to isProcessingQueue
+        ))
       }
       "pauseDownload" -> result.success(downloadManager.pauseDownload(call.argument<String>("url")!!))
       "resumeDownload" -> {
@@ -76,6 +88,7 @@ class MultithreadDownloadsPlugin: FlutterPlugin, MethodCallHandler, EventChannel
         // Clear the queue when all downloads are cancelled
         downloadQueue.clear()
         isProcessingQueue = false
+        sendQueueStatus()
         result.success(cancelled)
       }
       "pauseDownloads" -> {
@@ -99,20 +112,36 @@ class MultithreadDownloadsPlugin: FlutterPlugin, MethodCallHandler, EventChannel
       "getAllDownloads" -> result.success(downloadManager.getAllDownloads())
       "getBatchProgress" -> result.success(downloadManager.getBatchProgress())
       "clearCompletedDownloads" -> result.success(downloadManager.clearCompletedDownloads())
-      "getQueueSize" -> result.success(downloadQueue.size) // Optional: to check queue size
+      "getQueueSize" -> result.success(downloadQueue.size)
+      "getQueueStatus" -> result.success(getQueueStatus())
+      "clearQueue" -> {
+        downloadQueue.clear()
+        result.success(true)
+      }
       else -> result.notImplemented()
     }
   }
 
   private fun processDownloadQueue() {
-    if (isProcessingQueue || downloadQueue.isEmpty()) {
-      return
+    // Use synchronized to prevent race conditions
+    synchronized(this) {
+      if (isProcessingQueue || downloadQueue.isEmpty()) {
+        return
+      }
+
+      // Use the isReadyForNewBatch function here
+      if (!downloadManager.isReadyForNewBatch()) {
+        println("Download manager not ready for new batch, waiting...")
+        return
+      }
+
+      isProcessingQueue = true
     }
 
-    isProcessingQueue = true
     val request = downloadQueue.poll()
-
     if (request != null) {
+      println("Processing download request with ${request.urls.size} URLs")
+
       downloadManager.startBatchDownload(
         request.urls,
         request.filePath,
@@ -124,28 +153,48 @@ class MultithreadDownloadsPlugin: FlutterPlugin, MethodCallHandler, EventChannel
           sendProgress(progress)
         },
         onBatchComplete = {
-          // Batch completed, process next item in queue
-          isProcessingQueue = false
-          processDownloadQueue()
+          println("Batch completed, processing next item in queue")
+          synchronized(this) {
+            isProcessingQueue = false
+          }
+          sendQueueStatus()
+
+          // Use a small delay to ensure cleanup is complete before processing next batch
+          mainHandler.postDelayed({
+            processDownloadQueue()
+          }, 100) // 100ms delay
         }
       )
+
+      sendQueueStatus()
     } else {
-      isProcessingQueue = false
+      synchronized(this) {
+        isProcessingQueue = false
+      }
     }
   }
 
-  private fun isBatchComplete(batchProgress: Map<String, Any>): Boolean {
-    // You'll need to implement this based on your ParallelDownloadManager's getBatchProgress() structure
-    // This is just an example - adjust according to your actual implementation
-    val totalFiles = batchProgress["totalFiles"] as? Int ?: 0
-    val completedFiles = batchProgress["completedFiles"] as? Int ?: 0
-    val failedFiles = batchProgress["failedFiles"] as? Int ?: 0
-    val cancelledFiles = batchProgress["cancelledFiles"] as? Int ?: 0
-
-    return (completedFiles + failedFiles + cancelledFiles) >= totalFiles
+  private fun getQueueStatus(): Map<String, Any> {
+    return mapOf(
+      "queueSize" to downloadQueue.size,
+      "isProcessing" to isProcessingQueue,
+      "isBatchActive" to downloadManager.isBatchActive(),
+      "currentBatchComplete" to downloadManager.isBatchComplete(),
+      "isReadyForNewBatch" to downloadManager.isReadyForNewBatch()
+    )
   }
 
-  override fun onListen(arguments: Any?, events: EventChannel.EventSink?) { eventSink = events }
+  private fun sendQueueStatus() {
+    val queueStatus = getQueueStatus()
+    sendProgress(queueStatus + ("isQueueStatus" to true))
+  }
+
+  override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+    eventSink = events
+    // Send initial queue status
+    sendQueueStatus()
+  }
+
   override fun onCancel(arguments: Any?) { eventSink = null }
 
   private fun sendProgress(progress: Map<String, Any>) {
