@@ -11,6 +11,8 @@ class MultithreadedDownloads {
   static const EventChannel _progressChannel = EventChannel('multithread_downloads/progress');
 
   static Stream<DownloadProgress>? _progressStream;
+  static bool _isDownloading = false;
+  static final List<Map<String, dynamic>> _downloadQueue = [];
 
   // Keep a reference to your server so you can close it if needed
   HttpServer? _localServer;
@@ -67,6 +69,45 @@ class MultithreadedDownloads {
     int timeoutSeconds = 30,
   }) async {
     try {
+      // Check if files are already downloaded
+      Directory dir = Directory(filePath);
+      if (await dir.exists()) {
+        bool allFilesExist = true;
+
+        for (int i = 0; i < urls.length; i++) {
+          String expectedFileName = fileName.isNotEmpty
+              ? (urls.length > 1 ? '${fileName}_$i' : fileName)
+              : Uri.parse(urls[i]).pathSegments.last;
+
+          File file = File('$filePath/$expectedFileName');
+          if (!await file.exists() || await file.length() == 0) {
+            allFilesExist = false;
+            break;
+          }
+        }
+
+        if (allFilesExist) {
+          return false; // All files already exist
+        }
+      }
+
+      // If currently downloading, add to queue
+      if (_isDownloading) {
+        _downloadQueue.add({
+          'urls': urls,
+          'fileName': fileName,
+          'filePath': filePath,
+          'headers': headers ?? {},
+          'maxConcurrentTasks': maxConcurrentTasks,
+          'retryCount': retryCount,
+          'timeoutSeconds': timeoutSeconds,
+        });
+        return false; // Queued for later
+      }
+
+      // Start download
+      _isDownloading = true;
+
       final result = await _channel.invokeMethod('startDownload', {
         'urls': urls,
         'fileName': fileName,
@@ -76,9 +117,61 @@ class MultithreadedDownloads {
         'retryCount': retryCount,
         'timeoutSeconds': timeoutSeconds,
       });
-      return result == true;
+
+      // Wait for completion and process queue
+      if (result == true) {
+        _waitForCompletionAndProcessQueue(urls, filePath, fileName);
+        return true;
+      } else {
+        _isDownloading = false;
+        return false;
+      }
     } catch (e) {
+      _isDownloading = false;
       return false;
+    }
+  }
+
+  static void _waitForCompletionAndProcessQueue(
+      List<String> urls,
+      String filePath,
+      String fileName
+      ) async {
+    // Wait for current download to complete
+    while (true) {
+      await Future.delayed(Duration(seconds: 1));
+
+      // Check if all files are downloaded
+      bool allDownloaded = true;
+      for (int i = 0; i < urls.length; i++) {
+        String expectedFileName = fileName.isNotEmpty
+            ? (urls.length > 1 ? '${fileName}_$i' : fileName)
+            : Uri.parse(urls[i]).pathSegments.last;
+
+        File file = File('$filePath/$expectedFileName');
+        if (!await file.exists() || await file.length() == 0) {
+          allDownloaded = false;
+          break;
+        }
+      }
+
+      if (allDownloaded) break;
+    }
+
+    _isDownloading = false;
+
+    // Process next in queue
+    if (_downloadQueue.isNotEmpty) {
+      Map<String, dynamic> nextDownload = _downloadQueue.removeAt(0);
+      startDownload(
+        urls: nextDownload['urls'],
+        filePath: nextDownload['filePath'],
+        fileName: nextDownload['fileName'],
+        headers: nextDownload['headers'],
+        maxConcurrentTasks: nextDownload['maxConcurrentTasks'],
+        retryCount: nextDownload['retryCount'],
+        timeoutSeconds: nextDownload['timeoutSeconds'],
+      );
     }
   }
 
