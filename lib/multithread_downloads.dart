@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:io';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as io;
@@ -9,40 +8,22 @@ import 'package:shelf_static/shelf_static.dart';
 class MultithreadedDownloads {
   static const MethodChannel _channel = MethodChannel('multithread_downloads');
   static const EventChannel _progressChannel = EventChannel('multithread_downloads/progress');
-
   static Stream<DownloadProgress>? _progressStream;
-
-  // Keep a reference to your server so you can close it if needed
   HttpServer? _localServer;
 
   Future<void> startLocalHttpServer(String directoryPath, int port) async {
     final dir = Directory(directoryPath);
+    if (!await dir.exists()) throw Exception('Directory does not exist: $directoryPath');
 
-    // Validate directory
-    if (!await dir.exists()) {
-      throw Exception('Directory does not exist: $directoryPath');
-    }
-
-    // List files for debugging
     print('Files in directory:');
     await for (var entity in dir.list()) {
       print('  ${entity.path}');
     }
 
-    var handler = createStaticHandler(
-      directoryPath,
-      serveFilesOutsidePath: true,
-      listDirectories: true,
-    );
-
-    // Add middleware for logging
-    var loggedHandler = Pipeline()
-        .addMiddleware(logRequests())
-        .addHandler(handler);
-
-    _localServer = await io.serve(loggedHandler, 'localhost', port);
-    print('Server started at http://localhost:$port');
-    print('Serving: ${dir.absolute.path}');
+    final handler = createStaticHandler(directoryPath, serveFilesOutsidePath: true, listDirectories: true);
+    final pipeline = Pipeline().addMiddleware(logRequests()).addHandler(handler);
+    _localServer = await io.serve(pipeline, 'localhost', port);
+    print('Server started at http://localhost:$port\nServing: ${dir.absolute.path}');
   }
 
   Future<void> stopLocalHttpServer() async {
@@ -51,9 +32,9 @@ class MultithreadedDownloads {
   }
 
   static Stream<DownloadProgress> get progressStream {
-    _progressStream ??= _progressChannel
-        .receiveBroadcastStream()
-        .map((event) => DownloadProgress.fromMap(Map<String, dynamic>.from(event)));
+    _progressStream ??= _progressChannel.receiveBroadcastStream().map(
+          (event) => DownloadProgress.fromMap(Map<String, dynamic>.from(event)),
+    );
     return _progressStream!;
   }
 
@@ -82,87 +63,18 @@ class MultithreadedDownloads {
     }
   }
 
-  static Future<bool> pauseDownload(String url) async {
-    try {
-      final result = await _channel.invokeMethod('pauseDownload', {'url': url});
-      return result == true;
-    } catch (e) {
-      return false;
-    }
-  }
+  /// Unified control: pause / resume / cancel (url, urls, or all)
+  static Future<bool> pauseDownload(String url) => _invokeBoolMethod('pause', {'url': url});
+  static Future<bool> resumeDownload(String url) => _invokeBoolMethod('resume', {'url': url});
+  static Future<bool> cancelDownload(String url) => _invokeBoolMethod('cancel', {'url': url});
 
-  static Future<bool> resumeDownload(String url) async {
-    try {
-      final result = await _channel.invokeMethod('resumeDownload', {'url': url});
-      return result == true;
-    } catch (e) {
-      return false;
-    }
-  }
+  static Future<bool> pauseDownloads(List<String> urls) => _invokeBoolMethod('pause', {'urls': urls});
+  static Future<bool> resumeDownloads(List<String> urls) => _invokeBoolMethod('resume', {'urls': urls});
+  static Future<bool> cancelDownloads(List<String> urls) => _invokeBoolMethod('cancel', {'urls': urls});
 
-  static Future<bool> cancelDownload(String url) async {
-    try {
-      final result = await _channel.invokeMethod('cancelDownload', {'url': url});
-      return result == true;
-    } catch (e) {
-      return false;
-    }
-  }
-
-  // Batch operations for multiple URLs
-  static Future<bool> pauseAllDownloads() async {
-    try {
-      final result = await _channel.invokeMethod('pauseAllDownloads');
-      return result == true;
-    } catch (e) {
-      return false;
-    }
-  }
-
-  static Future<bool> resumeAllDownloads() async {
-    try {
-      final result = await _channel.invokeMethod('resumeAllDownloads');
-      return result == true;
-    } catch (e) {
-      return false;
-    }
-  }
-
-  static Future<bool> cancelAllDownloads() async {
-    try {
-      final result = await _channel.invokeMethod('cancelAllDownloads');
-      return result == true;
-    } catch (e) {
-      return false;
-    }
-  }
-
-  static Future<bool> pauseDownloads(List<String> urls) async {
-    try {
-      final result = await _channel.invokeMethod('pauseDownloads', {'urls': urls});
-      return result == true;
-    } catch (e) {
-      return false;
-    }
-  }
-
-  static Future<bool> resumeDownloads(List<String> urls) async {
-    try {
-      final result = await _channel.invokeMethod('resumeDownloads', {'urls': urls});
-      return result == true;
-    } catch (e) {
-      return false;
-    }
-  }
-
-  static Future<bool> cancelDownloads(List<String> urls) async {
-    try {
-      final result = await _channel.invokeMethod('cancelDownloads', {'urls': urls});
-      return result == true;
-    } catch (e) {
-      return false;
-    }
-  }
+  static Future<bool> pauseAllDownloads() => _invokeBoolMethod('pause');
+  static Future<bool> resumeAllDownloads() => _invokeBoolMethod('resume');
+  static Future<bool> cancelAllDownloads() => _invokeBoolMethod('cancel');
 
   static Future<Map<String, dynamic>?> getDownloadStatus(String url) async {
     try {
@@ -200,13 +112,21 @@ class MultithreadedDownloads {
     }
   }
 
-  // Get overall progress for batch downloads
   static Future<BatchDownloadProgress?> getBatchProgress() async {
     try {
       final result = await _channel.invokeMethod('getBatchProgress');
       return BatchDownloadProgress.fromMap(Map<String, dynamic>.from(result));
     } catch (e) {
       return null;
+    }
+  }
+
+  static Future<bool> _invokeBoolMethod(String method, [Map<String, dynamic>? args]) async {
+    try {
+      final result = await _channel.invokeMethod(method, args);
+      return result == true;
+    } catch (e) {
+      return false;
     }
   }
 }
@@ -217,7 +137,7 @@ class DownloadProgress {
   final int progress;
   final int bytesDownloaded;
   final int totalBytes;
-  late final DownloadStatus status;
+  final DownloadStatus status;
   final String? error;
   final double speed;
 

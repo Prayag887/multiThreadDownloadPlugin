@@ -1,6 +1,6 @@
 package com.example.multithread_downloads
 
-import android.content.Context
+import android.app.Activity
 import android.os.Handler
 import android.os.Looper
 import androidx.annotation.NonNull
@@ -8,20 +8,30 @@ import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
-import io.flutter.plugin.common.MethodChannel.MethodCallHandler
-import io.flutter.plugin.common.MethodChannel.Result
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
-class MultithreadDownloadsPlugin: FlutterPlugin, MethodCallHandler, EventChannel.StreamHandler {
+class MultithreadDownloadsPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChannel.StreamHandler {
   private lateinit var channel: MethodChannel
   private lateinit var eventChannel: EventChannel
   private var eventSink: EventChannel.EventSink? = null
   private val mainHandler = Handler(Looper.getMainLooper())
   private val downloadManager = ParallelDownloadManager()
 
-  // Use ConcurrentLinkedQueue for thread safety
   private val downloadQueue = ConcurrentLinkedQueue<DownloadRequest>()
-  private var isProcessingQueue = false
+  private val isProcessingQueue = AtomicBoolean(false)
+  private val lastProgressUpdate = AtomicLong(0)
+  private val progressThrottleMs = 100L // Throttle progress updates
+
+  // Pre-allocated objects to reduce GC pressure
+  private val queueStatusMap = mutableMapOf<String, Any>()
+  private val progressMap = mutableMapOf<String, Any>()
+
+  // Reusable Runnable to avoid object allocation
+  private val progressUpdateRunnable = Runnable {
+    eventSink?.success(progressMap.toMap()) // Create defensive copy only when needed
+  }
 
   data class DownloadRequest(
     val urls: List<String>,
@@ -40,172 +50,174 @@ class MultithreadDownloadsPlugin: FlutterPlugin, MethodCallHandler, EventChannel
     eventChannel.setStreamHandler(this)
   }
 
-  override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: Result) {
+  override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
     when (call.method) {
       "startDownload" -> {
-        println("headers::: ${call.argument<Map<String, String>>("headers") ?: emptyMap()}")
-        val urls = call.argument<List<String>>("urls") ?: emptyList()
-        val filePath = call.argument<String>("filePath")!!
-        val headers = call.argument<Map<String, String>>("headers") ?: emptyMap()
-        val maxConcurrentTasks = call.argument<Int>("maxConcurrentTasks") ?: 50
-        val retryCount = call.argument<Int>("retryCount") ?: 3
-        val timeoutSeconds = call.argument<Int>("timeoutSeconds") ?: 30
-
         val downloadRequest = DownloadRequest(
-          urls, filePath, headers, maxConcurrentTasks, retryCount, timeoutSeconds
+          urls = call.argument("urls") ?: emptyList(),
+          filePath = call.argument("filePath")!!,
+          headers = call.argument("headers") ?: emptyMap(),
+          maxConcurrentTasks = call.argument("maxConcurrentTasks") ?: 50,
+          retryCount = call.argument("retryCount") ?: 3,
+          timeoutSeconds = call.argument("timeoutSeconds") ?: 30
         )
-
-        // Add to queue
         downloadQueue.offer(downloadRequest)
-        println("Added download request to queue. Queue size: ${downloadQueue.size}")
-
-        // Send queue status update
-        sendQueueStatus()
-
-        // Process queue
+        sendQueueStatusImmediate()
         processDownloadQueue()
-
         result.success(mapOf(
           "success" to true,
           "queueSize" to downloadQueue.size,
-          "isProcessing" to isProcessingQueue
+          "isProcessing" to isProcessingQueue.get()
         ))
       }
-      "pauseDownload" -> result.success(downloadManager.pauseDownload(call.argument<String>("url")!!))
-      "resumeDownload" -> {
-        val url = call.argument<String>("url")!!
-        downloadManager.resumeDownload(url) { sendProgress(it) }
-        result.success(true)
+
+      "pause", "resume", "cancel" -> {
+        val urls: List<String>? = call.argument<List<String>>("urls")
+        val url: String? = call.argument<String>("url")
+
+        val action: Boolean = when (call.method) {
+          "pause" -> when {
+            urls != null -> downloadManager.pauseDownloads(urls)
+            url != null -> downloadManager.pauseDownload(url)
+            else -> downloadManager.pauseAllDownloads()
+          }
+          "resume" -> {
+            when {
+              urls != null -> {
+                downloadManager.resumeDownloads(urls, ::sendProgressThrottled)
+                true
+              }
+              url != null -> {
+                downloadManager.resumeDownload(url, ::sendProgressThrottled)
+                true
+              }
+              else -> {
+                downloadManager.resumeAllDownloads(::sendProgressThrottled)
+                true
+              }
+            }
+          }
+          "cancel" -> when {
+            urls != null -> downloadManager.cancelDownloads(urls)
+            url != null -> downloadManager.cancelDownload(url)
+            else -> {
+              downloadQueue.clear()
+              isProcessingQueue.set(false)
+              sendQueueStatusImmediate()
+              downloadManager.cancelAllDownloads()
+              true
+            }
+          }
+          else -> false
+        }
+        result.success(action)
       }
-      "cancelDownload" -> result.success(downloadManager.cancelDownload(call.argument<String>("url")!!))
-      "pauseAllDownloads" -> result.success(downloadManager.pauseAllDownloads())
-      "resumeAllDownloads" -> {
-        downloadManager.resumeAllDownloads() { sendProgress(it) }
-        result.success(true)
-      }
-      "cancelAllDownloads" -> {
-        val cancelled = downloadManager.cancelAllDownloads()
-        // Clear the queue when all downloads are cancelled
-        downloadQueue.clear()
-        isProcessingQueue = false
-        sendQueueStatus()
-        result.success(cancelled)
-      }
-      "pauseDownloads" -> {
-        val urls = call.argument<List<String>>("urls") ?: emptyList()
-        result.success(downloadManager.pauseDownloads(urls))
-      }
-      "resumeDownloads" -> {
-        val urls = call.argument<List<String>>("urls") ?: emptyList()
-        downloadManager.resumeDownloads(urls) { sendProgress(it) }
-        result.success(true)
-      }
-      "cancelDownloads" -> {
-        val urls = call.argument<List<String>>("urls") ?: emptyList()
-        result.success(downloadManager.cancelDownloads(urls))
-      }
+
       "getDownloadStatus" -> result.success(downloadManager.getDownloadStatus(call.argument<String>("url")!!))
-      "getDownloadStatuses" -> {
-        val urls = call.argument<List<String>>("urls") ?: emptyList()
-        result.success(downloadManager.getDownloadStatuses(urls))
-      }
+      "getDownloadStatuses" -> result.success(downloadManager.getDownloadStatuses(call.argument("urls") ?: emptyList()))
       "getAllDownloads" -> result.success(downloadManager.getAllDownloads())
       "getBatchProgress" -> result.success(downloadManager.getBatchProgress())
       "clearCompletedDownloads" -> result.success(downloadManager.clearCompletedDownloads())
       "getQueueSize" -> result.success(downloadQueue.size)
-      "getQueueStatus" -> result.success(getQueueStatus())
+      "getQueueStatus" -> result.success(getQueueStatusMap())
       "clearQueue" -> {
         downloadQueue.clear()
         result.success(true)
       }
+
       else -> result.notImplemented()
     }
   }
 
-  private fun processDownloadQueue() {
-    // Use synchronized to prevent race conditions
-    synchronized(this) {
-      if (isProcessingQueue || downloadQueue.isEmpty()) {
-        return
-      }
+  private fun processDownloadQueue(): Unit {
+    if (!isProcessingQueue.compareAndSet(false, true)) return
 
-      // Use the isReadyForNewBatch function here
-      if (!downloadManager.isReadyForNewBatch()) {
-        println("Download manager not ready for new batch, waiting...")
-        return
-      }
-
-      isProcessingQueue = true
+    if (downloadQueue.isEmpty() || !downloadManager.isReadyForNewBatch()) {
+      isProcessingQueue.set(false)
+      return
     }
 
     val request = downloadQueue.poll()
-    if (request != null) {
-      println("Processing download request with ${request.urls.size} URLs")
+    if (request == null) {
+      isProcessingQueue.set(false)
+      return
+    }
 
-      downloadManager.startBatchDownload(
-        request.urls,
-        request.filePath,
-        request.headers,
-        request.maxConcurrentTasks,
-        request.retryCount,
-        request.timeoutSeconds,
-        onProgress = { progress ->
-          sendProgress(progress)
-        },
-        onBatchComplete = {
-          println("Batch completed, processing next item in queue")
-          synchronized(this) {
-            isProcessingQueue = false
-          }
-          sendQueueStatus()
-
-          // Use a small delay to ensure cleanup is complete before processing next batch
-          mainHandler.postDelayed({
-            processDownloadQueue()
-          }, 100) // 100ms delay
+    downloadManager.startBatchDownload(
+      request.urls, request.filePath, request.headers,
+      request.maxConcurrentTasks, request.retryCount, request.timeoutSeconds,
+      onProgress = ::sendProgressThrottled,
+      onBatchComplete = {
+        isProcessingQueue.set(false)
+        sendQueueStatusImmediate()
+        // Process next item immediately if available, otherwise schedule
+        if (downloadQueue.isNotEmpty()) {
+          processDownloadQueue()
+        } else {
+          onDestroy()
+          mainHandler.postDelayed({ processDownloadQueue() }, 100) // Reduced delay
         }
-      )
+      }
+    )
+    sendQueueStatusImmediate()
+  }
 
-      sendQueueStatus()
-    } else {
-      synchronized(this) {
-        isProcessingQueue = false
+  private fun getQueueStatusMap(): Map<String, Any> {
+    // Reuse the same map to reduce allocations
+    queueStatusMap.clear()
+    queueStatusMap["queueSize"] = downloadQueue.size
+    queueStatusMap["isProcessing"] = isProcessingQueue.get()
+    queueStatusMap["isBatchActive"] = downloadManager.isBatchActive()
+    queueStatusMap["currentBatchComplete"] = downloadManager.isBatchComplete()
+    queueStatusMap["isReadyForNewBatch"] = downloadManager.isReadyForNewBatch()
+    return queueStatusMap.toMap() // Return defensive copy
+  }
+
+  private fun sendQueueStatusImmediate(): Unit {
+    val statusMap = getQueueStatusMap().toMutableMap()
+    statusMap["isQueueStatus"] = true
+    sendProgressImmediate(statusMap)
+  }
+
+  private fun sendProgressThrottled(progress: Map<String, Any>): Unit {
+    val currentTime = System.currentTimeMillis()
+    val lastUpdate = lastProgressUpdate.get()
+
+    if (currentTime - lastUpdate >= progressThrottleMs) {
+      if (lastProgressUpdate.compareAndSet(lastUpdate, currentTime)) {
+        sendProgressImmediate(progress)
       }
     }
   }
 
-  private fun getQueueStatus(): Map<String, Any> {
-    return mapOf(
-      "queueSize" to downloadQueue.size,
-      "isProcessing" to isProcessingQueue,
-      "isBatchActive" to downloadManager.isBatchActive(),
-      "currentBatchComplete" to downloadManager.isBatchComplete(),
-      "isReadyForNewBatch" to downloadManager.isReadyForNewBatch()
-    )
-  }
+  private fun sendProgressImmediate(progress: Map<String, Any>): Unit {
+    progressMap.clear()
+    progressMap.putAll(progress)
 
-  private fun sendQueueStatus() {
-    val queueStatus = getQueueStatus()
-    sendProgress(queueStatus + ("isQueueStatus" to true))
+    // Remove handler callbacks to prevent queue buildup
+    mainHandler.removeCallbacks(progressUpdateRunnable)
+    mainHandler.post(progressUpdateRunnable)
   }
 
   override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
     eventSink = events
-    // Send initial queue status
-    sendQueueStatus()
+    sendQueueStatusImmediate()
   }
 
-  override fun onCancel(arguments: Any?) { eventSink = null }
-
-  private fun sendProgress(progress: Map<String, Any>) {
-    mainHandler.post { eventSink?.success(progress) }
+  override fun onCancel(arguments: Any?) {
+    eventSink = null
+    // Clean up any pending progress updates
+    mainHandler.removeCallbacks(progressUpdateRunnable)
   }
 
   override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
     channel.setMethodCallHandler(null)
     eventChannel.setStreamHandler(null)
-    downloadManager.cancelAllDownloads()
-    downloadQueue.clear()
-    isProcessingQueue = false
+    mainHandler.removeCallbacks(progressUpdateRunnable)
+  }
+
+   fun onDestroy() {
+    isProcessingQueue.set(false)
+    downloadManager.cleanup()
   }
 }

@@ -172,20 +172,23 @@ class ParallelDownloadManager {
 
     fun resumeDownload(url: String, onProgress: (Map<String, Any>) -> Unit) {
         downloads[url]?.let { task ->
-            if (task.status == DownloadStatus.PAUSED) {
-                task.speedHistory.clear()
-                task.job = scope.launch {
-                    try {
-                        if (task.url.endsWith(".m3u8", ignoreCase = true)) {
-                            val basePath = File(task.filePath).parent ?: ""
-                            hlsDownloader.downloadHlsStreamAdvanced(task, basePath, onProgress)
-                        } else {
-                            httpsDownloader.downloadSingleFile(task, onProgress)
+            synchronized(task) {
+                if (task.status == DownloadStatus.PAUSED) {
+                    task.status = DownloadStatus.INITIALIZING
+                    task.speedHistory.clear()
+                    task.job = scope.launch {
+                        try {
+                            if (task.url.endsWith(".m3u8", ignoreCase = true)) {
+                                val basePath = File(task.filePath).parent ?: ""
+                                hlsDownloader.downloadHlsStreamAdvanced(task, basePath, onProgress)
+                            } else {
+                                httpsDownloader.downloadSingleFile(task, onProgress)
+                            }
+                        } catch (e: Exception) {
+                            task.status = DownloadStatus.FAILED
+                            task.error = e.message
+                            sendProgress(task, onProgress)
                         }
-                    } catch (e: Exception) {
-                        task.status = DownloadStatus.FAILED
-                        task.error = e.message
-                        sendProgress(task, onProgress)
                     }
                 }
             }
@@ -194,12 +197,25 @@ class ParallelDownloadManager {
 
     fun cancelDownload(url: String): Boolean {
         return downloads[url]?.let { task ->
-            task.status = DownloadStatus.CANCELLED
-            task.job?.cancel()
-            File(task.filePath).delete()
-            downloads.remove(url)
-            true
-        } ?: false
+            synchronized(task) {
+                task.status = DownloadStatus.CANCELLED
+                task.job?.cancel()
+
+                // Improved file deletion with error handling
+                try {
+                    val file = File(task.filePath)
+                    if (file.exists()) {
+                        file.delete()
+                    }
+                } catch (e: Exception) {
+                    // Log error but don't fail the cancellation
+                    println("Warning: Could not delete file ${task.filePath}: ${e.message}")
+                }
+
+                downloads.remove(url)
+                true
+            }
+        } == true
     }
 
     fun pauseAllDownloads(): Boolean {
@@ -219,19 +235,24 @@ class ParallelDownloadManager {
         val pausedTasks = downloads.values.filter { it.status == DownloadStatus.PAUSED }
         if (pausedTasks.isNotEmpty()) {
             pausedTasks.forEach { task ->
-                task.speedHistory.clear()
-                task.job = scope.launch {
-                    try {
-                        if (task.url.endsWith(".m3u8", ignoreCase = true)) {
-                            val basePath = File(task.filePath).parent ?: ""
-                            hlsDownloader.downloadHlsStreamAdvanced(task, basePath, onProgress)
-                        } else {
-                            httpsDownloader.downloadSingleFile(task, onProgress)
+                synchronized(task) {
+                    if (task.status == DownloadStatus.PAUSED) {
+                        task.status = DownloadStatus.INITIALIZING
+                        task.speedHistory.clear()
+                        task.job = scope.launch {
+                            try {
+                                if (task.url.endsWith(".m3u8", ignoreCase = true)) {
+                                    val basePath = File(task.filePath).parent ?: ""
+                                    hlsDownloader.downloadHlsStreamAdvanced(task, basePath, onProgress)
+                                } else {
+                                    httpsDownloader.downloadSingleFile(task, onProgress)
+                                }
+                            } catch (e: Exception) {
+                                task.status = DownloadStatus.FAILED
+                                task.error = e.message
+                                sendProgress(task, onProgress)
+                            }
                         }
-                    } catch (e: Exception) {
-                        task.status = DownloadStatus.FAILED
-                        task.error = e.message
-                        sendProgress(task, onProgress)
                     }
                 }
             }
@@ -241,11 +262,23 @@ class ParallelDownloadManager {
     fun cancelAllDownloads(): Boolean {
         batchJob?.cancel()
         onBatchComplete = null
+
         downloads.values.forEach { task ->
-            task.status = DownloadStatus.CANCELLED
-            task.job?.cancel()
-            File(task.filePath).delete()
+            synchronized(task) {
+                task.status = DownloadStatus.CANCELLED
+                task.job?.cancel()
+
+                try {
+                    val file = File(task.filePath)
+                    if (file.exists()) {
+                        file.delete()
+                    }
+                } catch (e: Exception) {
+                    println("Warning: Could not delete file ${task.filePath}: ${e.message}")
+                }
+            }
         }
+
         downloads.clear()
         return true
     }
@@ -267,20 +300,23 @@ class ParallelDownloadManager {
     fun resumeDownloads(urls: List<String>, onProgress: (Map<String, Any>) -> Unit) {
         urls.forEach { url ->
             downloads[url]?.let { task ->
-                if (task.status == DownloadStatus.PAUSED) {
-                    task.speedHistory.clear()
-                    task.job = scope.launch {
-                        try {
-                            if (task.url.endsWith(".m3u8", ignoreCase = true)) {
-                                val basePath = File(task.filePath).parent ?: ""
-                                hlsDownloader.downloadHlsStreamAdvanced(task, basePath, onProgress)
-                            } else {
-                                httpsDownloader.downloadSingleFile(task, onProgress)
+                synchronized(task) {
+                    if (task.status == DownloadStatus.PAUSED) {
+                        task.status = DownloadStatus.INITIALIZING
+                        task.speedHistory.clear()
+                        task.job = scope.launch {
+                            try {
+                                if (task.url.endsWith(".m3u8", ignoreCase = true)) {
+                                    val basePath = File(task.filePath).parent ?: ""
+                                    hlsDownloader.downloadHlsStreamAdvanced(task, basePath, onProgress)
+                                } else {
+                                    httpsDownloader.downloadSingleFile(task, onProgress)
+                                }
+                            } catch (e: Exception) {
+                                task.status = DownloadStatus.FAILED
+                                task.error = e.message
+                                sendProgress(task, onProgress)
                             }
-                        } catch (e: Exception) {
-                            task.status = DownloadStatus.FAILED
-                            task.error = e.message
-                            sendProgress(task, onProgress)
                         }
                     }
                 }
@@ -292,11 +328,22 @@ class ParallelDownloadManager {
         var hasActive = false
         urls.forEach { url ->
             downloads[url]?.let { task ->
-                task.status = DownloadStatus.CANCELLED
-                task.job?.cancel()
-                File(task.filePath).delete()
-                downloads.remove(url)
-                hasActive = true
+                synchronized(task) {
+                    task.status = DownloadStatus.CANCELLED
+                    task.job?.cancel()
+
+                    try {
+                        val file = File(task.filePath)
+                        if (file.exists()) {
+                            file.delete()
+                        }
+                    } catch (e: Exception) {
+                        println("Warning: Could not delete file ${task.filePath}: ${e.message}")
+                    }
+
+                    downloads.remove(url)
+                    hasActive = true
+                }
             }
         }
         return hasActive
@@ -335,27 +382,59 @@ class ParallelDownloadManager {
     fun getBatchProgress(): Map<String, Any>? {
         if (downloads.isEmpty()) return null
 
-        val allTasks = downloads.values.toList()
-        val totalBytes = allTasks.sumOf { it.totalBytes }
-        val downloadedBytes = allTasks.sumOf { it.downloadedBytes }
-        val completedCount = allTasks.count { it.status == DownloadStatus.COMPLETED }
-        val failedCount = allTasks.count { it.status == DownloadStatus.FAILED }
-        val cancelledCount = allTasks.count { it.status == DownloadStatus.CANCELLED }
-        val activeCount = allTasks.count { it.status == DownloadStatus.DOWNLOADING }
-        val pausedCount = allTasks.count { it.status == DownloadStatus.PAUSED }
+        val allTasks = downloads.values
+        var totalBytes = 0L
+        var downloadedBytes = 0L
+        var completedCount = 0
+        var failedCount = 0
+        var cancelledCount = 0
+        var activeCount = 0
+        var pausedCount = 0
+        var speedSum = 0.0
+        var speedCount = 0
+        val individualProgress = mutableListOf<Map<String, Any>>()
+        val urls = mutableListOf<String>()
+
+        // Single pass through all tasks
+        allTasks.forEach { task ->
+            totalBytes += task.totalBytes
+            downloadedBytes += task.downloadedBytes
+            urls.add(task.url)
+
+            when (task.status) {
+                DownloadStatus.COMPLETED -> completedCount++
+                DownloadStatus.FAILED -> failedCount++
+                DownloadStatus.CANCELLED -> cancelledCount++
+                DownloadStatus.DOWNLOADING -> activeCount++
+                DownloadStatus.PAUSED -> pausedCount++
+                else -> {} // INITIALIZING, etc.
+            }
+
+            val taskSpeed = if (task.speedHistory.isNotEmpty()) {
+                val avgSpeed = task.speedHistory.average()
+                speedSum += avgSpeed
+                speedCount++
+                avgSpeed
+            } else {
+                0.0
+            }
+
+            individualProgress.add(mapOf(
+                "url" to task.url,
+                "progress" to if (task.totalBytes > 0) (task.downloadedBytes * 100.0 / task.totalBytes).toInt() else 0,
+                "status" to task.status.value,
+                "speed" to taskSpeed
+            ))
+        }
 
         val overallProgress = if (totalBytes > 0) {
             (downloadedBytes * 100.0 / totalBytes).toInt()
         } else 0
 
-        val averageSpeed = allTasks
-            .filter { it.speedHistory.isNotEmpty() }
-            .map { it.speedHistory.average() }
-            .takeIf { it.isNotEmpty() }
-            ?.average() ?: 0.0
+        val averageSpeed = if (speedCount > 0) speedSum / speedCount else 0.0
 
         return mapOf(
-            "urls" to allTasks.map { it.url },
+            "urls" to urls,
             "overallProgress" to overallProgress,
             "totalBytesDownloaded" to downloadedBytes,
             "totalBytes" to totalBytes,
@@ -368,14 +447,7 @@ class ParallelDownloadManager {
             "averageSpeed" to averageSpeed,
             "isComplete" to isBatchComplete(),
             "isReadyForNewBatch" to isReadyForNewBatch(),
-            "individualProgress" to allTasks.map { task ->
-                mapOf(
-                    "url" to task.url,
-                    "progress" to if (task.totalBytes > 0) (task.downloadedBytes * 100.0 / task.totalBytes).toInt() else 0,
-                    "status" to task.status.value,
-                    "speed" to if (task.speedHistory.isNotEmpty()) task.speedHistory.average() else 0.0
-                )
-            }
+            "individualProgress" to individualProgress
         )
     }
 
@@ -384,5 +456,17 @@ class ParallelDownloadManager {
     fun clearCompletedDownloads(): Boolean {
         downloads.entries.removeAll { it.value.status == DownloadStatus.COMPLETED }
         return true
+    }
+
+    fun cleanup() {
+        batchJob?.cancel()
+        scope.cancel()
+        downloads.values.forEach { task ->
+            task.job?.cancel()
+        }
+        downloads.clear()
+        onBatchComplete = null
+        httpsDownloader.cleanUp()
+        hlsDownloader.cleanup()
     }
 }

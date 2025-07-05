@@ -10,179 +10,90 @@ import java.io.File
 import java.io.IOException
 import java.io.RandomAccessFile
 import java.util.concurrent.Executors
-import java.util.concurrent.PriorityBlockingQueue
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.*
 
 /**
- * High-performance HLS downloader with ExoPlayer-inspired optimizations
- * Combines coroutines with thread pool management for maximum efficiency
+ * Mobile-optimized HLS downloader - Maximum speed with mobile efficiency
  */
 class HighPerformanceHlsDownloader {
 
-    // Performance tracking and configuration
-    private data class PerformanceMetrics(
-        var avgDownloadSpeed: Double = 0.0,
-        var connectionSuccessRate: Double = 1.0,
-        var lastSpeedUpdate: Long = 0L,
-        val speedHistory: MutableList<Double> = mutableListOf()
+    private data class SegmentTask(
+        val url: String,
+        val fileName: String,
+        val duration: Double = 10.0,
+        var retryCount: Int = 0,
+        var size: Long = 0L
     )
 
-    private data class AdaptiveConfig(
-        var concurrentDownloaders: Int,
-        var maxConnections: Int,
-        var useChunking: Boolean,
-        var chunkSize: Int,
-        var bufferSize: Int
-    ) {
-        fun adapt(metrics: PerformanceMetrics, segmentSize: Long) {
-            when {
-                segmentSize <= 100_000 -> { // Small segments (≤100KB)
-                    concurrentDownloaders = 20
-                    maxConnections = 30
-                    useChunking = false
-                    bufferSize = 8192
-                }
-                segmentSize <= 1_000_000 -> { // Medium segments (≤1MB)
-                    concurrentDownloaders = 15
-                    maxConnections = 25
-                    useChunking = false
-                    bufferSize = 16384
-                }
-                else -> { // Large segments (>1MB)
-                    concurrentDownloaders = 10
-                    maxConnections = 15
-                    useChunking = true
-                    chunkSize = 512_000
-                    bufferSize = 32768
-                }
-            }
+    private data class MobileConfig(
+        val concurrentDownloaders: Int,
+        val maxConnections: Int,
+        val bufferSize: Int,
+        val chunkSize: Int,
+        val useChunking: Boolean
+    )
 
-            // Adapt based on performance
-            if (metrics.avgDownloadSpeed > 0) {
-                val networkCapacity = metrics.avgDownloadSpeed * 1.2
-                if (metrics.avgDownloadSpeed < networkCapacity * 0.7 && concurrentDownloaders < 25) {
-                    concurrentDownloaders = min(concurrentDownloaders + 2, 25)
-                } else if (metrics.avgDownloadSpeed > networkCapacity * 0.95 && concurrentDownloaders > 5) {
-                    concurrentDownloaders = max(concurrentDownloaders - 1, 5)
-                }
-            }
-        }
-    }
-
-    // Priority-based segment task
-    private data class PrioritySegmentTask(
-        val segment: SegmentTask,
-        val priority: Int,
-        val segmentIndex: Int,
-        var retryCount: Int = 0,
-        var failed: Boolean = false
-    ) : Comparable<PrioritySegmentTask> {
-        override fun compareTo(other: PrioritySegmentTask): Int = when {
-            priority != other.priority -> other.priority - priority
-            else -> segmentIndex - other.segmentIndex
-        }
-    }
-
-    // High-performance HTTP client with adaptive configuration
+    // Mobile-optimized HTTP client - aggressive settings for speed
     private val httpClient = OkHttpClient.Builder()
-        .connectionPool(ConnectionPool(50, 5, java.util.concurrent.TimeUnit.MINUTES))
-        .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
-        .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-        .writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+        .connectionPool(ConnectionPool(40, 5, java.util.concurrent.TimeUnit.MINUTES))
+        .connectTimeout(5, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+        .writeTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
         .dispatcher(Dispatcher().apply {
-            maxRequests = 100
-            maxRequestsPerHost = 20
+            maxRequests = 200
+            maxRequestsPerHost = 40
         })
+        .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1)) // HTTP/2 for mobile
         .build()
 
-    // Thread pool for I/O operations
+    // Optimized thread pool for mobile
     private val ioExecutor = Executors.newCachedThreadPool { r ->
-        Thread(r, "HLS-IO-${System.currentTimeMillis()}").apply {
-            isDaemon = true
-            priority = Thread.NORM_PRIORITY + 1
+        Thread(r, "HLS-Mobile").apply {
+            isDaemon = false
+            priority = Thread.MAX_PRIORITY
         }
     }
 
-    // Performance metrics
-    private val performanceMetrics = AtomicReference(PerformanceMetrics())
-    private val config = AtomicReference(AdaptiveConfig(12, 20, false, 256_000, 16384))
+    // Mobile-adaptive configuration
+    private val mobileConfig = getMobileOptimizedConfig()
 
-    /**
-     * Main download function with advanced optimizations
-     */
-    /**
-     * Fixed download worker with proper queue handling
-     */
-    private suspend fun downloadWorker(
-        workerId: Int,
-        segmentQueue: PriorityBlockingQueue<PrioritySegmentTask>,
-        playlistDir: File,
-        headers: Map<String, String>,
-        config: AdaptiveConfig,
-        totalDownloadedBytes: AtomicLong,
-        downloadedSegments: AtomicInteger,
-        progressChannel: Channel<ProgressUpdate>,
-        semaphore: Semaphore,
-        isCompleted: AtomicReference<Boolean> // Add completion flag
-    ) {
-        while (!isCompleted.get()) {
-            val priorityTask = try {
-                // Use blocking take with timeout instead of poll
-                segmentQueue.poll(1, java.util.concurrent.TimeUnit.SECONDS)
-            } catch (e: InterruptedException) {
-                break
-            }
+    private fun getMobileOptimizedConfig(): MobileConfig {
+        val cores = Runtime.getRuntime().availableProcessors()
+        val maxMemory = Runtime.getRuntime().maxMemory()
+        val isHighEndDevice = cores >= 6 && maxMemory > 1024 * 1024 * 1024 // 1GB+
 
-            if (priorityTask == null) {
-                // Check if we should continue waiting
-                if (!isCompleted.get()) {
-                    delay(100) // Small delay before checking again
-                    continue
-                } else {
-                    break
-                }
-            }
-
-            // Check for termination signal
-            if (priorityTask.priority == -1) break
-
-            semaphore.withPermit {
-                try {
-                    val startTime = System.currentTimeMillis()
-                    val bytesDownloaded = downloadSegmentAdvanced(
-                        priorityTask.segment, playlistDir, headers, config
-                    )
-                    val downloadTime = System.currentTimeMillis() - startTime
-
-                    totalDownloadedBytes.addAndGet(bytesDownloaded)
-                    downloadedSegments.incrementAndGet()
-
-                    progressChannel.trySend(ProgressUpdate(
-                        bytesDownloaded, downloadTime, true
-                    ))
-
-                } catch (e: Exception) {
-                    if (priorityTask.retryCount < 3) {
-                        priorityTask.retryCount++
-                        delay(2.0.pow(priorityTask.retryCount).toLong() * 200)
-                        segmentQueue.offer(priorityTask)
-                    } else {
-                        priorityTask.failed = true
-                        progressChannel.trySend(ProgressUpdate(0, 0, false))
-                        println("Worker $workerId: Failed to download ${priorityTask.segment.fileName} after retries: ${e.message}")
-                    }
-                }
-            }
+        return when {
+            isHighEndDevice -> MobileConfig(
+                concurrentDownloaders = 16,
+                maxConnections = 32,
+                bufferSize = 65536, // 64KB buffer for speed
+                chunkSize = 1024_000, // 1MB chunks
+                useChunking = true
+            )
+            cores >= 4 -> MobileConfig(
+                concurrentDownloaders = 12,
+                maxConnections = 24,
+                bufferSize = 32768,
+                chunkSize = 512_000,
+                useChunking = true
+            )
+            else -> MobileConfig(
+                concurrentDownloaders = 8,
+                maxConnections = 16,
+                bufferSize = 16384,
+                chunkSize = 256_000,
+                useChunking = false
+            )
         }
-        println("Worker $workerId: Exiting")
     }
 
     /**
-     * Fixed main download function with proper coordination
+     * Ultra-fast mobile download with aggressive optimization
      */
     suspend fun downloadHlsStreamAdvanced(
         task: DownloadTask,
@@ -200,104 +111,74 @@ class HighPerformanceHlsDownloader {
         val totalDownloadedBytes = AtomicLong(0L)
         val downloadedSegments = AtomicInteger(0)
         val totalSegments = AtomicInteger(0)
-        val isCompleted = AtomicReference(false) // Add completion flag
+        val isCompleted = AtomicReference(false)
 
         try {
-            // Phase 1: Analyze stream
-            val (variants, avgSegmentSize) = analyzeHlsStream(task.url, task.headers, baseUri)
+            // Phase 1: Fast playlist processing
+            val masterContent = fetchPlaylistContentFast(task.url, task.headers)
+            val variants = parseMasterPlaylist(masterContent, baseUri)
 
-            // Phase 2: Configure
-            val currentConfig = config.get().apply { adapt(performanceMetrics.get(), avgSegmentSize) }
-            config.set(currentConfig)
+            // Select BEST quality for maximum speed utilization
+            val selectedVariant = variants.maxByOrNull { it.bandwidth }
+                ?: throw IOException("No variants found")
 
-            // Phase 3: Create queues and channels
-            val segmentQueue = PriorityBlockingQueue<PrioritySegmentTask>()
-            val progressChannel = Channel<ProgressUpdate>(Channel.UNLIMITED)
+            // Phase 2: Parallel playlist and segment preparation
+            val (segments, avgSegmentSize) = async {
+                val variantContent = fetchPlaylistContentFast(selectedVariant.url, task.headers)
+                val segments = parseVariantPlaylist(variantContent, selectedVariant.url.toHttpUrlOrNull()!!, selectedVariant.fileName)
 
-            // Phase 4: Process playlists FIRST
-            println("Processing playlists...")
-            val playlistJobs = variants.take(1).mapIndexed { variantIndex, variant ->
-                async {
-                    processVariantPlaylist(
-                        variant, baseUri, task.headers, segmentQueue,
-                        totalSegments, variantIndex, playlistDir
-                    )
-                }
-            }
+                // Pre-analyze segment sizes for optimal chunking
+                val avgSize = estimateSegmentSizes(segments, task.headers)
+                Pair(segments, avgSize)
+            }.await()
 
-            // Wait for playlist processing to complete
-            playlistJobs.awaitAll()
-            println("Found ${totalSegments.get()} segments to download")
+            totalSegments.set(segments.size)
 
-            if (totalSegments.get() == 0) {
-                throw IOException("No segments found in playlist")
-            }
+            // Create playlists in parallel
+            launch { createLocalPlaylist(selectedVariant, segments, playlistDir) }
+            launch { createMasterPlaylist(listOf(selectedVariant), playlistDir) }
 
-            // Phase 5: Launch download workers AFTER segments are queued
-            val downloadScope = CoroutineScope(
-                Dispatchers.IO + SupervisorJob() +
-                        CoroutineName("HLS-Download-${System.currentTimeMillis()}")
-            )
+            task.filePath = File(playlistDir, "master.m3u8").absolutePath
+            task.totalBytes = avgSegmentSize * segments.size
 
-            val semaphore = Semaphore(currentConfig.maxConnections)
-            val downloadJobs = mutableListOf<Job>()
+            // Phase 3: Ultra-fast segment downloading
+            val segmentQueue = ConcurrentLinkedQueue<SegmentTask>()
+            segments.forEach { segmentQueue.offer(it) }
 
-            println("Starting ${currentConfig.concurrentDownloaders} download workers...")
-            repeat(currentConfig.concurrentDownloaders) { workerId ->
-                val job = downloadScope.launch {
-                    downloadWorker(
+            val semaphore = Semaphore(mobileConfig.maxConnections)
+            val progressChannel = Channel<Long>(Channel.UNLIMITED)
+
+            // Launch maximum workers for speed
+            val downloadJobs = (0 until mobileConfig.concurrentDownloaders).map { workerId ->
+                launch {
+                    ultraFastDownloadWorker(
                         workerId, segmentQueue, playlistDir, task.headers,
-                        currentConfig, totalDownloadedBytes, downloadedSegments,
-                        progressChannel, semaphore, isCompleted
+                        totalDownloadedBytes, downloadedSegments,
+                        progressChannel, semaphore, isCompleted, avgSegmentSize
                     )
                 }
-                downloadJobs.add(job)
             }
 
-            // Phase 6: Progress tracking
+            // Minimal overhead progress tracking
             val progressJob = launch {
-                handleProgressUpdates(
+                fastProgressTracking(
                     progressChannel, task, totalDownloadedBytes,
                     downloadedSegments, totalSegments, onProgress
                 )
             }
 
-            // Phase 7: Performance monitoring
-            val monitoringJob = launch {
-                monitorPerformance(totalDownloadedBytes, task.startTime)
-            }
-
-            // Phase 8: Wait for downloads to complete
-            while (downloadedSegments.get() < totalSegments.get()) {
-                delay(500) // Check every 500ms
-                println("Progress: ${downloadedSegments.get()}/${totalSegments.get()} segments downloaded")
-            }
-
-            // Signal completion
-            isCompleted.set(true)
-
-            // Send termination signals to workers
-            repeat(currentConfig.concurrentDownloaders) {
-                segmentQueue.offer(PrioritySegmentTask(
-                    SegmentTask("", ""), -1, -1
-                ))
-            }
-
+            // Wait for completion
             downloadJobs.joinAll()
+            isCompleted.set(true)
             progressChannel.close()
             progressJob.join()
-            monitoringJob.cancel()
-
-            // Phase 9: Create final playlists
-            createMasterPlaylist(variants.take(1), playlistDir)
 
             task.status = DownloadStatus.COMPLETED
             task.downloadedBytes = totalDownloadedBytes.get()
-            task.filePath = File(playlistDir, "master.m3u8").absolutePath
             sendProgress(task, onProgress)
 
         } catch (e: Exception) {
-            isCompleted.set(true) // Ensure workers stop
+            isCompleted.set(true)
             task.status = DownloadStatus.FAILED
             task.error = e.message
             sendProgress(task, onProgress)
@@ -306,122 +187,77 @@ class HighPerformanceHlsDownloader {
     }
 
     /**
-     * Analyzes HLS stream to determine optimal download strategy
+     * Ultra-fast download worker with intelligent chunking
      */
-    private suspend fun analyzeHlsStream(
-        masterUrl: String,
+    private suspend fun ultraFastDownloadWorker(
+        workerId: Int,
+        segmentQueue: ConcurrentLinkedQueue<SegmentTask>,
+        playlistDir: File,
         headers: Map<String, String>,
-        baseUri: HttpUrl
-    ): Pair<List<VariantPlaylist>, Long> {
-
-        val masterContent = fetchPlaylistContent(masterUrl, headers)
-        val variants = parseMasterPlaylist(masterContent, baseUri)
-//        val avgSegmentSize = estimateSegmentSizeAdvanced(sampleSegments, headers)
-        val avgSegmentSize = 500_000L
-
-        return Pair(variants, avgSegmentSize)
-    }
-
-//    private suspend fun analyzeHlsStream(
-//        masterUrl: String,
-//        headers: Map<String, String>,
-//        baseUri: HttpUrl
-//    ): Pair<List<VariantPlaylist>, Long> {
-//
-//        val masterContent = fetchPlaylistContent(masterUrl, headers)
-//        val variants = parseMasterPlaylist(masterContent, baseUri)
-//
-//        // Sample segments from the highest quality variant for size estimation
-//        val primaryVariant = variants.firstOrNull() ?: throw IOException("No variants found")
-//        val sampleSegments = getSampleSegments(primaryVariant, baseUri, headers, 5)
-//        val avgSegmentSize = estimateSegmentSizeAdvanced(sampleSegments, headers)
-//
-//        return Pair(variants, avgSegmentSize)
-//    }
-
-    /**
-     * Processes variant playlist and creates prioritized segment tasks
-     */
-    private suspend fun processVariantPlaylist(
-        variant: VariantPlaylist,
-        baseUri: HttpUrl,
-        headers: Map<String, String>,
-        segmentQueue: PriorityBlockingQueue<PrioritySegmentTask>,
-        totalSegments: AtomicInteger,
-        variantIndex: Int,
-        playlistDir: File
+        totalDownloadedBytes: AtomicLong,
+        downloadedSegments: AtomicInteger,
+        progressChannel: Channel<Long>,
+        semaphore: Semaphore,
+        isCompleted: AtomicReference<Boolean>,
+        avgSegmentSize: Long
     ) {
-        try {
-            println("Processing variant: ${variant.url}")
-            val variantContent = fetchPlaylistContent(variant.url, headers)
-            println("Variant content length: ${variantContent.length}")
-            val variantUri = variant.url.toHttpUrlOrNull()!!
-            val segments = parseVariantPlaylist(variantContent, variantUri, variant.fileName)
-            println("Found ${segments.size} segments in variant")
-            totalSegments.addAndGet(segments.size)
+        // Pre-allocate buffer for maximum speed
+        val buffer = ByteArray(mobileConfig.bufferSize)
 
-            // Create prioritized tasks
-            segments.forEachIndexed { index, segment ->
-                val priority = calculateSegmentPriority(index, segments.size, variantIndex)
-                segmentQueue.offer(PrioritySegmentTask(segment, priority, index))
+        while (!isCompleted.get()) {
+            val segment = segmentQueue.poll() ?: break
+
+            semaphore.withPermit {
+                try {
+                    val bytesDownloaded = if (mobileConfig.useChunking && avgSegmentSize > mobileConfig.chunkSize) {
+                        downloadSegmentChunked(segment, playlistDir, headers, buffer)
+                    } else {
+                        downloadSegmentStreaming(segment, playlistDir, headers, buffer)
+                    }
+
+                    totalDownloadedBytes.addAndGet(bytesDownloaded)
+                    downloadedSegments.incrementAndGet()
+                    progressChannel.trySend(bytesDownloaded)
+
+                } catch (e: Exception) {
+                    if (segment.retryCount < 2) {
+                        segment.retryCount++
+                        // Immediate retry for speed
+                        segmentQueue.offer(segment)
+                    }
+                }
             }
-
-            // Create local playlist asynchronously
-            withContext(Dispatchers.IO) {
-                createLocalPlaylist(variant, segments, playlistDir)
-            }
-
-        } catch (e: Exception) {
-            println("Error processing variant ${variant.url}: ${e.message}")
         }
     }
 
     /**
-     * Advanced segment download with streaming and chunking support
+     * Streaming download optimized for mobile
      */
-    private suspend fun downloadSegmentAdvanced(
+    private suspend fun downloadSegmentStreaming(
         segment: SegmentTask,
         playlistDir: File,
         headers: Map<String, String>,
-        config: AdaptiveConfig
+        buffer: ByteArray
     ): Long = withContext(Dispatchers.IO) {
 
         val segmentFile = File(playlistDir, segment.fileName)
-
         if (segmentFile.exists() && segmentFile.length() > 0) {
             return@withContext segmentFile.length()
         }
 
-        if (config.useChunking) {
-            downloadSegmentChunked(segment, segmentFile, headers, config)
-        } else {
-            downloadSegmentStreaming(segment, segmentFile, headers, config)
-        }
-    }
-
-    /**
-     * Streaming download for better memory efficiency
-     */
-    private suspend fun downloadSegmentStreaming(
-        segment: SegmentTask,
-        segmentFile: File,
-        headers: Map<String, String>,
-        config: AdaptiveConfig
-    ): Long {
         val request = Request.Builder()
             .url(segment.url)
             .apply { headers.forEach { (key, value) -> addHeader(key, value) } }
             .build()
 
-        return httpClient.newCall(request).execute().use { response ->
+        httpClient.newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
-                throw IOException("Download failed: ${segment.url} (${response.code})")
+                throw IOException("Download failed: ${response.code}")
             }
 
             val inputStream = response.body!!.byteStream()
-            val outputStream = segmentFile.outputStream().buffered(config.bufferSize)
+            val outputStream = segmentFile.outputStream().buffered(mobileConfig.bufferSize)
 
-            val buffer = ByteArray(config.bufferSize)
             var totalBytes = 0L
             var bytesRead: Int
 
@@ -437,32 +273,36 @@ class HighPerformanceHlsDownloader {
     }
 
     /**
-     * Chunked download for large segments
+     * Parallel chunked download for large segments
      */
     private suspend fun downloadSegmentChunked(
         segment: SegmentTask,
-        segmentFile: File,
+        playlistDir: File,
         headers: Map<String, String>,
-        config: AdaptiveConfig
+        buffer: ByteArray
     ): Long = coroutineScope {
 
-        // Get content length
-        val contentLength = getContentLength(segment.url, headers)
-            ?: return@coroutineScope downloadSegmentStreaming(segment, segmentFile, headers, config)
-
-        if (contentLength <= config.chunkSize) {
-            return@coroutineScope downloadSegmentStreaming(segment, segmentFile, headers, config)
+        val segmentFile = File(playlistDir, segment.fileName)
+        if (segmentFile.exists() && segmentFile.length() > 0) {
+            return@coroutineScope segmentFile.length()
         }
 
-        val chunks = (contentLength + config.chunkSize - 1) / config.chunkSize
+        val contentLength = getContentLength(segment.url, headers)
+            ?: return@coroutineScope downloadSegmentStreaming(segment, playlistDir, headers, buffer)
+
+        if (contentLength <= mobileConfig.chunkSize) {
+            return@coroutineScope downloadSegmentStreaming(segment, playlistDir, headers, buffer)
+        }
+
+        val chunks = ((contentLength + mobileConfig.chunkSize - 1) / mobileConfig.chunkSize).toInt()
         val randomAccessFile = RandomAccessFile(segmentFile, "rw")
         randomAccessFile.setLength(contentLength)
 
         try {
-            val chunkJobs = (0 until chunks.toInt()).map { chunkIndex ->
+            val chunkJobs = (0 until chunks).map { chunkIndex ->
                 async(Dispatchers.IO) {
-                    val start = chunkIndex * config.chunkSize.toLong()
-                    val end = min(start + config.chunkSize - 1, contentLength - 1)
+                    val start = chunkIndex * mobileConfig.chunkSize.toLong()
+                    val end = min(start + mobileConfig.chunkSize - 1, contentLength - 1)
 
                     val request = Request.Builder()
                         .url(segment.url)
@@ -493,16 +333,10 @@ class HighPerformanceHlsDownloader {
     }
 
     /**
-     * Enhanced progress handling with performance metrics
+     * Fast progress tracking with minimal overhead
      */
-    private data class ProgressUpdate(
-        val bytesDownloaded: Long,
-        val downloadTime: Long,
-        val success: Boolean
-    )
-
-    private suspend fun handleProgressUpdates(
-        progressChannel: Channel<ProgressUpdate>,
+    private suspend fun fastProgressTracking(
+        progressChannel: Channel<Long>,
         task: DownloadTask,
         totalDownloadedBytes: AtomicLong,
         downloadedSegments: AtomicInteger,
@@ -510,70 +344,48 @@ class HighPerformanceHlsDownloader {
         onProgress: (Map<String, Any>) -> Unit
     ) {
         var lastUpdate = 0L
-        val updateInterval = 300L // 300ms for smooth updates
+        val updateInterval = 500L // Balanced frequency
 
-        for (update in progressChannel) {
+        for (bytesDownloaded in progressChannel) {
             val now = System.currentTimeMillis()
 
-            if (now - lastUpdate >= updateInterval ||
-                downloadedSegments.get() >= totalSegments.get()) {
-
+            if (now - lastUpdate >= updateInterval) {
                 task.downloadedBytes = totalDownloadedBytes.get()
-
-                // Estimate total size if not known
-                if (task.totalBytes <= 0 && downloadedSegments.get() > 0) {
-                    val avgBytesPerSegment = totalDownloadedBytes.get() / downloadedSegments.get()
-                    task.totalBytes = avgBytesPerSegment * totalSegments.get()
-                }
-
                 sendProgress(task, onProgress)
                 lastUpdate = now
             }
-
-            // Break if all segments downloaded
-            if (downloadedSegments.get() >= totalSegments.get() && totalSegments.get() > 0) {
-                break
-            }
         }
     }
 
-    /**
-     * Performance monitoring for adaptive optimization
-     */
-    private suspend fun monitorPerformance(
-        totalDownloadedBytes: AtomicLong,
-        startTime: Long
-    ) {
-        while (true) {
-            delay(2000) // Monitor every 2 seconds
+    // Optimized helper functions
+    private suspend fun fetchPlaylistContentFast(url: String, headers: Map<String, String>): String {
+        val request = Request.Builder()
+            .url(url)
+            .apply { headers.forEach { (key, value) -> addHeader(key, value) } }
+            .build()
 
-            val currentTime = System.currentTimeMillis()
-            val timeElapsed = currentTime - startTime
-            val currentSpeed = totalDownloadedBytes.get() * 1000.0 / timeElapsed
-
-            val metrics = performanceMetrics.get()
-            metrics.speedHistory.add(currentSpeed)
-            if (metrics.speedHistory.size > 20) {
-                metrics.speedHistory.removeAt(0)
-            }
-
-            metrics.avgDownloadSpeed = metrics.speedHistory.average()
-            metrics.lastSpeedUpdate = currentTime
-
-            performanceMetrics.set(metrics)
+        return httpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw IOException("Failed to fetch: ${response.code}")
+            response.body?.string() ?: throw IOException("Empty content")
         }
     }
 
-    // Helper functions
+    private suspend fun estimateSegmentSizes(
+        segments: List<SegmentTask>,
+        headers: Map<String, String>
+    ): Long = coroutineScope {
+        if (segments.isEmpty()) return@coroutineScope 500_000L
 
-    private fun calculateSegmentPriority(index: Int, totalSegments: Int, variantIndex: Int): Int {
-        return when {
-            index < 5 -> 100 - index // Highest priority for first segments
-            index < totalSegments * 0.1 -> 80 - index // High priority for early segments
-            index < totalSegments * 0.3 -> 60 // Medium priority
-            else -> 40 // Normal priority
-        } - (variantIndex * 10) // Prefer higher quality variants
+        val sampleSize = min(1, segments.size)
+        val sampleSizes = segments.take(sampleSize).map { segment ->
+            async(Dispatchers.IO) {
+                getContentLength(segment.url, headers) ?: 200_000L
+            }
+        }.awaitAll()
+
+        sampleSizes.average().toLong()
     }
+
 
     private suspend fun getContentLength(url: String, headers: Map<String, String>): Long? {
         return try {
@@ -588,34 +400,6 @@ class HighPerformanceHlsDownloader {
             }
         } catch (e: Exception) {
             null
-        }
-    }
-
-//    private suspend fun estimateSegmentSizeAdvanced(
-//        sampleSegments: List<SegmentTask>,
-//        headers: Map<String, String>
-//    ): Long {
-//        if (sampleSegments.isEmpty()) return 200_000L
-//
-//        val sizes = sampleSegments.mapNotNull { segment ->
-//            getContentLength(segment.url, headers)
-//        }
-//
-//        return if (sizes.isNotEmpty()) {
-//            sizes.average().toLong()
-//        } else 200_000L
-//    }
-
-    // Reuse existing helper functions from original code
-    private suspend fun fetchPlaylistContent(url: String, headers: Map<String, String>): String {
-        val request = Request.Builder()
-            .url(url)
-            .apply { headers.forEach { (key, value) -> addHeader(key, value) } }
-            .build()
-
-        return httpClient.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) throw IOException("Failed to fetch playlist: $url (${response.code})")
-            response.body?.string() ?: throw IOException("Empty playlist content")
         }
     }
 
@@ -634,7 +418,6 @@ class HighPerformanceHlsDownloader {
 
                 val resolutionMatch = Regex("RESOLUTION=(\\d+x\\d+)").find(line)
                 currentResolution = resolutionMatch?.groupValues?.get(1) ?: ""
-
             } else if (line.isNotEmpty() && !line.startsWith("#")) {
                 val variantUrl = baseUri.resolve(line)!!.toString()
                 val variantFileName = line.substringAfterLast("/")
@@ -642,21 +425,7 @@ class HighPerformanceHlsDownloader {
             }
         }
 
-        return variants.sortedByDescending { it.bandwidth }
-    }
-
-    private suspend fun getSampleSegments(
-        variant: VariantPlaylist,
-        baseUri: HttpUrl,
-        headers: Map<String, String>,
-        sampleCount: Int = 3
-    ): List<SegmentTask> {
-        return try {
-            val variantContent = fetchPlaylistContent(variant.url, headers)
-            parseVariantPlaylist(variantContent, baseUri, variant.fileName).take(sampleCount)
-        } catch (e: Exception) {
-            emptyList()
-        }
+        return variants.sortedByDescending { it.bandwidth } // Highest quality first
     }
 
     private fun parseVariantPlaylist(content: String, baseUri: HttpUrl, variantName: String): List<SegmentTask> {
@@ -673,7 +442,7 @@ class HighPerformanceHlsDownloader {
             } else if (line.isNotEmpty() && !line.startsWith("#")) {
                 val segmentUrl = baseUri.resolve(line)!!.toString()
                 val segmentFileName = "${variantName}_${line.substringAfterLast("/")}"
-                segments.add(SegmentTask(segmentUrl, segmentFileName, duration = segmentDuration))
+                segments.add(SegmentTask(segmentUrl, segmentFileName, segmentDuration))
             }
         }
 
@@ -723,23 +492,9 @@ class HighPerformanceHlsDownloader {
         val timeElapsed = max(1L, currentTime - task.startTime)
         val currentSpeed = task.downloadedBytes * 1000.0 / timeElapsed
 
-        task.speedHistory.add(currentSpeed)
-        if (task.speedHistory.size > 10) {
-            task.speedHistory.removeAt(0)
-        }
-
-        val avgSpeed = if (task.speedHistory.isNotEmpty()) {
-            task.speedHistory.average()
-        } else currentSpeed
-
         val progress = if (task.totalBytes > 0) {
             (task.downloadedBytes * 100.0 / task.totalBytes).toInt()
         } else -1
-
-        val remainingBytes = task.totalBytes - task.downloadedBytes
-        val estimatedTimeRemaining = if (avgSpeed > 0 && remainingBytes > 0) {
-            (remainingBytes / avgSpeed * 1000).toLong()
-        } else -1L
 
         onProgress(mapOf(
             "url" to task.url,
@@ -749,12 +504,12 @@ class HighPerformanceHlsDownloader {
             "totalBytes" to task.totalBytes,
             "status" to task.status.value,
             "error" to (task.error ?: ""),
-            "speed" to avgSpeed,
-            "estimatedTimeRemaining" to estimatedTimeRemaining
+            "speed" to currentSpeed,
+            "estimatedTimeRemaining" to if (currentSpeed > 0)
+                ((task.totalBytes - task.downloadedBytes) / currentSpeed * 1000).toLong() else -1L
         ))
     }
 
-    // Cleanup method
     fun cleanup() {
         ioExecutor.shutdown()
         httpClient.dispatcher.executorService.shutdown()

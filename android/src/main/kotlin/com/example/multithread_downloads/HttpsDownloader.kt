@@ -132,4 +132,8 @@ class HttpsDownloader {
             "speed" to avgSpeed
         ))
     }
+
+    fun cleanUp() {
+        HttpClientConfig.client.dispatcher.executorService.shutdown()
+    }
 }
