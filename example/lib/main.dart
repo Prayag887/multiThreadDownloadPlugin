@@ -24,7 +24,7 @@ class _MyAppState extends State<MyApp> {
   List<DownloadProgress> downloads = [];
   BetterPlayerController? _playerController;
   final List<String> _defaultUrls = [
-  'https://vz-da43afc1-1ad.b-cdn.net/bcdn_token=aaW5LOkiSUCFZyisahJmYi6MJsbFLc87UBTj4HmeRZ0&expires=1751270441&token_path=%2F455d9f48-072a-4693-a86f-c624431e5789/455d9f48-072a-4693-a86f-c624431e5789/playlist.m3u8',
+    'https://agimgcdn.b-cdn.net/language_cache_datas/lang_cache_data_1_2_18a1230c-0d17-483c-8fa7-ae1d9fb01e19.json?token=rnDNX6VfIGICYctW9rYEvhMGtz0VJ4So8tgWNGv3fYI&class=thumbnail&format=webp&expires=1751458876',
   ];
   final TextEditingController _urlsController = TextEditingController();
   int _downloadCounter = 1;
@@ -255,7 +255,7 @@ class _MyAppState extends State<MyApp> {
       ),
     );
 
-    return playlist?.path;
+    return playlist.path;
   }
 
   @override
