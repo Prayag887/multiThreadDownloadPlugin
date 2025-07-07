@@ -1,106 +1,156 @@
 import Foundation
-import Network
+import Combine
 
-/**
- * High-performance HLS downloader with adaptive optimizations
- * Combines Swift async/await with TaskGroup management for maximum efficiency
- */
+// MARK: - Data Models
+
+struct PerformanceMetrics {
+    var avgDownloadSpeed: Double = 0.0
+    var connectionSuccessRate: Double = 1.0
+    var lastSpeedUpdate: TimeInterval = 0
+    var speedHistory: [Double] = []
+}
+
+struct AdaptiveConfig {
+    var concurrentDownloaders: Int
+    var maxConnections: Int
+    var useChunking: Bool
+    var chunkSize: Int
+    var bufferSize: Int
+
+    init(concurrentDownloaders: Int = 12, maxConnections: Int = 20, useChunking: Bool = false, chunkSize: Int = 256000, bufferSize: Int = 16384) {
+        self.concurrentDownloaders = concurrentDownloaders
+        self.maxConnections = maxConnections
+        self.useChunking = useChunking
+        self.chunkSize = chunkSize
+        self.bufferSize = bufferSize
+    }
+
+    mutating func adapt(metrics: PerformanceMetrics, segmentSize: Int64) {
+        switch segmentSize {
+        case 0...100_000: // Small segments (≤100KB)
+            concurrentDownloaders = 20
+            maxConnections = 30
+            useChunking = false
+            bufferSize = 8192
+        case 100_001...1_000_000: // Medium segments (≤1MB)
+            concurrentDownloaders = 15
+            maxConnections = 25
+            useChunking = false
+            bufferSize = 16384
+        default: // Large segments (>1MB)
+            concurrentDownloaders = 10
+            maxConnections = 15
+            useChunking = true
+            chunkSize = 512_000
+            bufferSize = 32768
+        }
+
+        // Adapt based on performance
+        if metrics.avgDownloadSpeed > 0 {
+            let networkCapacity = metrics.avgDownloadSpeed * 1.2
+            if metrics.avgDownloadSpeed < networkCapacity * 0.7 && concurrentDownloaders < 25 {
+                concurrentDownloaders = min(concurrentDownloaders + 2, 25)
+            } else if metrics.avgDownloadSpeed > networkCapacity * 0.95 && concurrentDownloaders > 5 {
+                concurrentDownloaders = max(concurrentDownloaders - 1, 5)
+            }
+        }
+    }
+}
+
+struct SegmentTask {
+    let url: String
+    let fileName: String
+    let duration: Double
+
+    init(url: String, fileName: String, duration: Double = 10.0) {
+        self.url = url
+        self.fileName = fileName
+        self.duration = duration
+    }
+}
+
+@available(iOS 13.0, *)
+class PrioritySegmentTask: Comparable {
+    let segment: SegmentTask
+    let priority: Int
+    let segmentIndex: Int
+    var retryCount: Int = 0
+    var failed: Bool = false
+
+    init(segment: SegmentTask, priority: Int, segmentIndex: Int) {
+        self.segment = segment
+        self.priority = priority
+        self.segmentIndex = segmentIndex
+    }
+
+    static func < (lhs: PrioritySegmentTask, rhs: PrioritySegmentTask) -> Bool {
+        if lhs.priority != rhs.priority {
+            return lhs.priority > rhs.priority // Higher priority first
+        }
+        return lhs.segmentIndex < rhs.segmentIndex
+    }
+
+    static func == (lhs: PrioritySegmentTask, rhs: PrioritySegmentTask) -> Bool {
+        return lhs.priority == rhs.priority && lhs.segmentIndex == rhs.segmentIndex
+    }
+}
+
+struct VariantPlaylist {
+    let url: String
+    let fileName: String
+    let bandwidth: Int64
+    let resolution: String
+
+    init(url: String, fileName: String, bandwidth: Int64 = 0, resolution: String = "") {
+        self.url = url
+        self.fileName = fileName
+        self.bandwidth = bandwidth
+        self.resolution = resolution
+    }
+}
+
+struct ProgressUpdate {
+    let bytesDownloaded: Int64
+    let downloadTime: TimeInterval
+    let success: Bool
+}
+
+// MARK: - Thread-Safe Collections
+
+class ThreadSafePriorityQueue<T: Comparable> {
+    private var heap: [T] = []
+    private let lock = NSLock()
+
+    var isEmpty: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return heap.isEmpty
+    }
+
+    func offer(_ element: T) {
+        lock.lock()
+        defer { lock.unlock() }
+        heap.append(element)
+        heap.sort()
+    }
+
+    func poll() -> T? {
+        lock.lock()
+        defer { lock.unlock() }
+        return heap.isEmpty ? nil : heap.removeFirst()
+    }
+}
+
+// MARK: - Main HLS Downloader Class
+@available(iOS 13.0, *)
 class HighPerformanceHlsDownloader {
-
-    // MARK: - Performance Tracking and Configuration
-
-    private struct PerformanceMetrics {
-        var avgDownloadSpeed: Double = 0.0
-        var connectionSuccessRate: Double = 1.0
-        var lastSpeedUpdate: Int64 = 0
-        var speedHistory: [Double] = []
-
-        mutating func updateSpeed(_ speed: Double) {
-            speedHistory.append(speed)
-            if speedHistory.count > 20 {
-                speedHistory.removeFirst()
-            }
-            avgDownloadSpeed = speedHistory.reduce(0, +) / Double(speedHistory.count)
-            lastSpeedUpdate = Int64(Date().timeIntervalSince1970 * 1000)
-        }
-    }
-
-    private struct AdaptiveConfig {
-        var concurrentDownloaders: Int
-        var maxConnections: Int
-        var useChunking: Bool
-        var chunkSize: Int
-        var bufferSize: Int
-
-        mutating func adapt(metrics: PerformanceMetrics, segmentSize: Int64) {
-            switch segmentSize {
-            case ...100_000: // Small segments (≤100KB)
-                concurrentDownloaders = 20
-                maxConnections = 30
-                useChunking = false
-                bufferSize = 8192
-
-            case ...1_000_000: // Medium segments (≤1MB)
-                concurrentDownloaders = 15
-                maxConnections = 25
-                useChunking = false
-                bufferSize = 16384
-
-            default: // Large segments (>1MB)
-                concurrentDownloaders = 10
-                maxConnections = 15
-                useChunking = true
-                chunkSize = 512_000
-                bufferSize = 32768
-            }
-
-            // Adapt based on performance
-            if metrics.avgDownloadSpeed > 0 {
-                let networkCapacity = metrics.avgDownloadSpeed * 1.2
-                if metrics.avgDownloadSpeed < networkCapacity * 0.7 && concurrentDownloaders < 25 {
-                    concurrentDownloaders = min(concurrentDownloaders + 2, 25)
-                } else if metrics.avgDownloadSpeed > networkCapacity * 0.95 && concurrentDownloaders > 5 {
-                    concurrentDownloaders = max(concurrentDownloaders - 1, 5)
-                }
-            }
-        }
-    }
-
-    // Priority-based segment task
-    private struct PrioritySegmentTask: Comparable {
-        let segment: SegmentTask
-        let priority: Int
-        let segmentIndex: Int
-        var retryCount: Int = 0
-        var failed: Bool = false
-
-        static func < (lhs: PrioritySegmentTask, rhs: PrioritySegmentTask) -> Bool {
-            if lhs.priority != rhs.priority {
-                return lhs.priority > rhs.priority // Higher priority first
-            }
-            return lhs.segmentIndex < rhs.segmentIndex
-        }
-    }
-
-    // Progress update structure
-    private struct ProgressUpdate {
-        let bytesDownloaded: Int64
-        let downloadTime: Int64
-        let success: Bool
-    }
 
     // MARK: - Properties
 
-    private var urlSession: URLSession
+    private let session: URLSession
+    private let operationQueue: OperationQueue
     private var performanceMetrics = PerformanceMetrics()
-    private var config = AdaptiveConfig(
-        concurrentDownloaders: 12,
-        maxConnections: 20,
-        useChunking: false,
-        chunkSize: 256_000,
-        bufferSize: 16384
-    )
-
+    private var config = AdaptiveConfig()
     private let metricsLock = NSLock()
     private let configLock = NSLock()
 
@@ -108,34 +158,40 @@ class HighPerformanceHlsDownloader {
 
     init() {
         let configuration = URLSessionConfiguration.default
-        configuration.httpMaximumConnectionsPerHost = 20
-        configuration.timeoutIntervalForRequest = 10
-        configuration.timeoutIntervalForResource = 300
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.timeoutIntervalForRequest = 30
+        configuration.timeoutIntervalForResource = 60
+        configuration.httpMaximumConnectionsPerHost = 20
         configuration.urlCache = nil
 
-        self.urlSession = URLSession(configuration: configuration)
+        self.session = URLSession(configuration: configuration)
+
+        self.operationQueue = OperationQueue()
+        self.operationQueue.maxConcurrentOperationCount = 50
+        self.operationQueue.qualityOfService = .userInitiated
     }
 
     // MARK: - Main Download Function
 
+    @available(iOS 13.0.0, *)
     func downloadHlsStreamAdvanced(
-        task: DownloadTask,
+        task: inout MTDownloadTask,
         basePath: String,
         onProgress: @escaping ([String: Any]) -> Void
     ) async throws {
 
-        task.status = .downloading
-        task.startTime = Int64(Date().timeIntervalSince1970 * 1000)
+        // Create a local copy of the inout task
+        var currentTask = task
+        currentTask.status = .downloading
+        currentTask.startTime = Date().timeIntervalSince1970
 
-        let playlistDir = URL(fileURLWithPath: basePath).appendingPathComponent(
-            task.fileName.replacingOccurrences(of: ".m3u8", with: "")
-        )
+        let playlistURL = URL(fileURLWithPath: basePath)
+            .appendingPathComponent(currentTask.fileName.replacingOccurrences(of: ".m3u8", with: ""))
 
-        try FileManager.default.createDirectory(at: playlistDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: playlistURL, withIntermediateDirectories: true)
 
-        guard let baseUri = URL(string: task.url) else {
-            throw NSError(domain: "InvalidURL", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid HLS URL"])
+        guard let baseURL = URL(string: currentTask.url) else {
+            throw NSError(domain: "Invalid URL", code: -1)
         }
 
         let totalDownloadedBytes = AtomicInt64(0)
@@ -144,182 +200,111 @@ class HighPerformanceHlsDownloader {
         let isCompleted = AtomicBool(false)
 
         do {
-            // Phase 1: Analyze stream
             let (variants, avgSegmentSize) = try await analyzeHlsStream(
-                masterUrl: task.url,
-                headers: task.headers,
-                baseUri: baseUri
+                masterUrl: currentTask.url,
+                headers: currentTask.headers,
+                baseUri: baseURL
             )
 
-            // Phase 2: Configure
             configLock.lock()
             config.adapt(metrics: performanceMetrics, segmentSize: avgSegmentSize)
             let currentConfig = config
             configLock.unlock()
 
-            // Phase 3: Create segment queue
-            let segmentQueue = PriorityQueue<PrioritySegmentTask>()
+            let segmentQueue = ThreadSafePriorityQueue<PrioritySegmentTask>()
+            let progressSubject = PassthroughSubject<ProgressUpdate, Never>()
 
-            // Phase 4: Process playlists FIRST
-            print("Processing playlists...")
-
-            try await withTaskGroup(of: Void.self) { group in
-                for (variantIndex, variant) in variants.prefix(1).enumerated() {
-                    group.addTask {
-                        await self.processVariantPlaylist(
-                            variant: variant,
-                            baseUri: baseUri,
-                            headers: task.headers,
-                            segmentQueue: segmentQueue,
-                            totalSegments: totalSegments,
-                            variantIndex: variantIndex,
-                            playlistDir: playlistDir
-                        )
-                    }
-                }
-            }
+            try await processVariantPlaylists(
+                variants: Array(variants.prefix(1)),
+                baseUri: baseURL,
+                headers: currentTask.headers,
+                segmentQueue: segmentQueue,
+                totalSegments: totalSegments,
+                playlistDir: playlistURL
+            )
 
             print("Found \(totalSegments.value) segments to download")
 
-            guard totalSegments.value > 0 else {
-                throw NSError(domain: "NoSegments", code: -1, userInfo: [NSLocalizedDescriptionKey: "No segments found in playlist"])
+            if totalSegments.value == 0 {
+                throw NSError(domain: "No segments found in playlist", code: -1)
             }
 
-            // Phase 5: Launch download workers
-            let semaphore = AsyncSemaphore(value: currentConfig.maxConnections)
+            let semaphore = DispatchSemaphore(value: currentConfig.maxConnections)
 
-            print("Starting \(currentConfig.concurrentDownloaders) download workers...")
+            await withTaskGroup(of: Void.self) { group in
 
-            try await withTaskGroup(of: Void.self) { group in
-                // Add download workers
                 for workerId in 0..<currentConfig.concurrentDownloaders {
                     group.addTask {
                         await self.downloadWorker(
                             workerId: workerId,
                             segmentQueue: segmentQueue,
-                            playlistDir: playlistDir,
-                            headers: task.headers,
+                            playlistDir: playlistURL,
+                            headers: currentTask.headers,
                             config: currentConfig,
                             totalDownloadedBytes: totalDownloadedBytes,
                             downloadedSegments: downloadedSegments,
+                            progressSubject: progressSubject,
                             semaphore: semaphore,
                             isCompleted: isCompleted
                         )
                     }
                 }
 
-                // Add progress monitoring
                 group.addTask {
                     await self.handleProgressUpdates(
-                        task: task,
+                        progressSubject: progressSubject,
+                        task: &currentTask,
                         totalDownloadedBytes: totalDownloadedBytes,
                         downloadedSegments: downloadedSegments,
                         totalSegments: totalSegments,
-                        onProgress: onProgress,
-                        isCompleted: isCompleted
+                        onProgress: onProgress
                     )
                 }
 
-                // Add performance monitoring
                 group.addTask {
                     await self.monitorPerformance(
                         totalDownloadedBytes: totalDownloadedBytes,
-                        startTime: task.startTime,
-                        isCompleted: isCompleted
+                        startTime: currentTask.startTime
                     )
                 }
 
-                // Wait for completion
                 while downloadedSegments.value < totalSegments.value {
-                    try await Task.sleep(nanoseconds: 500_000_000) // 500ms
+                    try? await Task.sleep(nanoseconds: 500_000_000)
                     print("Progress: \(downloadedSegments.value)/\(totalSegments.value) segments downloaded")
                 }
 
                 isCompleted.setValue(true)
-                group.cancelAll()
+
+                for _ in 0..<currentConfig.concurrentDownloaders {
+                    let terminationTask = PrioritySegmentTask(
+                        segment: SegmentTask(url: "", fileName: ""),
+                        priority: -1,
+                        segmentIndex: -1
+                    )
+                    segmentQueue.offer(terminationTask)
+                }
             }
 
-            // Phase 6: Create final playlists
-            try createMasterPlaylist(variants: Array(variants.prefix(1)), playlistDir: playlistDir)
+            try createMasterPlaylist(variants: Array(variants.prefix(1)), playlistDir: playlistURL)
 
+            // Apply final updates back to original `inout task`
             task.status = .completed
             task.downloadedBytes = totalDownloadedBytes.value
-            task.filePath = playlistDir.appendingPathComponent("master.m3u8").path
-            sendProgress(for: task, onProgress: onProgress)
+            task.filePath = playlistURL.appendingPathComponent("master.m3u8").path
+            sendProgress(task: &task, onProgress: onProgress)
 
         } catch {
             isCompleted.setValue(true)
             task.status = .failed
             task.error = error.localizedDescription
-            sendProgress(for: task, onProgress: onProgress)
+            sendProgress(task: &task, onProgress: onProgress)
             throw error
         }
     }
 
-    // MARK: - Download Worker
 
-    private func downloadWorker(
-        workerId: Int,
-        segmentQueue: PriorityQueue<PrioritySegmentTask>,
-        playlistDir: URL,
-        headers: [String: String],
-        config: AdaptiveConfig,
-        totalDownloadedBytes: AtomicInt64,
-        downloadedSegments: AtomicInt,
-        semaphore: AsyncSemaphore,
-        isCompleted: AtomicBool
-    ) async {
-
-        while !isCompleted.value {
-            guard let priorityTask = segmentQueue.dequeue() else {
-                // No work available, wait a bit
-                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
-                continue
-            }
-
-            await semaphore.wait()
-            defer { semaphore.signal() }
-
-            do {
-                let startTime = Date()
-                let bytesDownloaded = try await downloadSegmentAdvanced(
-                    segment: priorityTask.segment,
-                    playlistDir: playlistDir,
-                    headers: headers,
-                    config: config
-                )
-                let downloadTime = Date().timeIntervalSince(startTime)
-
-                totalDownloadedBytes.add(bytesDownloaded)
-                downloadedSegments.increment()
-
-                // Update performance metrics
-                metricsLock.lock()
-                let speed = Double(bytesDownloaded) / downloadTime
-                performanceMetrics.updateSpeed(speed)
-                metricsLock.unlock()
-
-            } catch {
-                if priorityTask.retryCount < 3 {
-                    var retryTask = priorityTask
-                    retryTask.retryCount += 1
-
-                    // Exponential backoff
-                    let delayMs = UInt64(pow(2.0, Double(retryTask.retryCount)) * 200)
-                    try? await Task.sleep(nanoseconds: delayMs * 1_000_000)
-
-                    segmentQueue.enqueue(retryTask)
-                } else {
-                    print("Worker \(workerId): Failed to download \(priorityTask.segment.fileName) after retries: \(error)")
-                }
-            }
-        }
-
-        print("Worker \(workerId): Exiting")
-    }
-
-    // MARK: - Stream Analysis
-
+    // MARK: - Helper Methods
+    @available(iOS 13.0.0, *)
     private func analyzeHlsStream(
         masterUrl: String,
         headers: [String: String],
@@ -328,22 +313,50 @@ class HighPerformanceHlsDownloader {
 
         let masterContent = try await fetchPlaylistContent(url: masterUrl, headers: headers)
         let variants = parseMasterPlaylist(content: masterContent, baseUri: baseUri)
-        let avgSegmentSize: Int64 = 500_000 // Default estimate
+        let avgSegmentSize: Int64 = 500_000
 
         return (variants, avgSegmentSize)
     }
 
-    // MARK: - Playlist Processing
+    @available(iOS 13.0.0, *)
+    private func processVariantPlaylists(
+        variants: [VariantPlaylist],
+        baseUri: URL,
+        headers: [String: String],
+        segmentQueue: ThreadSafePriorityQueue<PrioritySegmentTask>,
+        totalSegments: AtomicInt,
+        playlistDir: URL
+    ) async throws {
 
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for (variantIndex, variant) in variants.enumerated() {
+                group.addTask {
+                    try await self.processVariantPlaylist(
+                        variant: variant,
+                        baseUri: baseUri,
+                        headers: headers,
+                        segmentQueue: segmentQueue,
+                        totalSegments: totalSegments,
+                        variantIndex: variantIndex,
+                        playlistDir: playlistDir
+                    )
+                }
+            }
+
+            try await group.waitForAll()
+        }
+    }
+
+    @available(iOS 13.0.0, *)
     private func processVariantPlaylist(
         variant: VariantPlaylist,
         baseUri: URL,
         headers: [String: String],
-        segmentQueue: PriorityQueue<PrioritySegmentTask>,
+        segmentQueue: ThreadSafePriorityQueue<PrioritySegmentTask>,
         totalSegments: AtomicInt,
         variantIndex: Int,
         playlistDir: URL
-    ) async {
+    ) async throws {
 
         do {
             print("Processing variant: \(variant.url)")
@@ -351,48 +364,127 @@ class HighPerformanceHlsDownloader {
             print("Variant content length: \(variantContent.count)")
 
             guard let variantUri = URL(string: variant.url) else {
-                print("Invalid variant URL: \(variant.url)")
-                return
+                throw NSError(domain: "Invalid variant URL", code: -1)
             }
 
-            let segments = parseVariantPlaylist(
-                content: variantContent,
-                baseUri: variantUri,
-                variantName: variant.fileName
-            )
-
+            let segments = parseVariantPlaylist(content: variantContent, baseUri: variantUri, variantName: variant.fileName)
             print("Found \(segments.count) segments in variant")
+
             totalSegments.add(segments.count)
 
             // Create prioritized tasks
             for (index, segment) in segments.enumerated() {
-                let priority = calculateSegmentPriority(
-                    index: index,
-                    totalSegments: segments.count,
-                    variantIndex: variantIndex
-                )
-                let priorityTask = PrioritySegmentTask(
-                    segment: segment,
-                    priority: priority,
-                    segmentIndex: index
-                )
-                segmentQueue.enqueue(priorityTask)
+                let priority = calculateSegmentPriority(index: index, totalSegments: segments.count, variantIndex: variantIndex)
+                let priorityTask = PrioritySegmentTask(segment: segment, priority: priority, segmentIndex: index)
+                segmentQueue.offer(priorityTask)
             }
 
             // Create local playlist
-            try createLocalPlaylist(
-                variant: variant,
-                segments: segments,
-                playlistDir: playlistDir
-            )
+            try createLocalPlaylist(variant: variant, segments: segments, playlistDir: playlistDir)
 
         } catch {
-            print("Error processing variant \(variant.url): \(error)")
+            print("Error processing variant \(variant.url): \(error.localizedDescription)")
+            throw error
         }
     }
 
-    // MARK: - Segment Download
+    @available(iOS 13.0.0, *)
+    private func downloadWorker(
+        workerId: Int,
+        segmentQueue: ThreadSafePriorityQueue<PrioritySegmentTask>,
+        playlistDir: URL,
+        headers: [String: String],
+        config: AdaptiveConfig,
+        totalDownloadedBytes: AtomicInt64,
+        downloadedSegments: AtomicInt,
+        progressSubject: PassthroughSubject<ProgressUpdate, Never>,
+        semaphore: DispatchSemaphore,
+        isCompleted: AtomicBool
+    ) async {
 
+        while !isCompleted.value {
+            // Poll for work with timeout
+            guard let priorityTask = await pollWithTimeout(queue: segmentQueue, timeoutSeconds: 1) else {
+                if !isCompleted.value {
+                    try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                    continue
+                } else {
+                    break
+                }
+            }
+
+            // Check for termination signal
+            if priorityTask.priority == -1 {
+                break
+            }
+
+            await withCheckedContinuation { continuation in
+                semaphore.wait()
+                continuation.resume()
+            }
+
+            do {
+                let startTime = Date().timeIntervalSince1970
+                let bytesDownloaded = try await downloadSegmentAdvanced(
+                    segment: priorityTask.segment,
+                    playlistDir: playlistDir,
+                    headers: headers,
+                    config: config
+                )
+                let downloadTime = Date().timeIntervalSince1970 - startTime
+
+                totalDownloadedBytes.add(bytesDownloaded)
+                downloadedSegments.increment()
+
+                progressSubject.send(ProgressUpdate(
+                    bytesDownloaded: bytesDownloaded,
+                    downloadTime: downloadTime,
+                    success: true
+                ))
+
+            } catch {
+                if priorityTask.retryCount < 3 {
+                    priorityTask.retryCount += 1
+                    let delay = pow(2.0, Double(priorityTask.retryCount)) * 0.2
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    segmentQueue.offer(priorityTask)
+                } else {
+                    priorityTask.failed = true
+                    progressSubject.send(ProgressUpdate(bytesDownloaded: 0, downloadTime: 0, success: false))
+                    print("Worker \(workerId): Failed to download \(priorityTask.segment.fileName) after retries: \(error.localizedDescription)")
+                }
+            }
+
+            semaphore.signal()
+        }
+
+        print("Worker \(workerId): Exiting")
+    }
+
+    @available(iOS 13.0.0, *)
+    private func pollWithTimeout(queue: ThreadSafePriorityQueue<PrioritySegmentTask>, timeoutSeconds: Int) async -> PrioritySegmentTask? {
+        return await withTaskGroup(of: PrioritySegmentTask?.self) { group in
+            group.addTask {
+                while true {
+                    if let task = queue.poll() {
+                        return task
+                    }
+                    try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
+                }
+            }
+
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds) * 1_000_000_000)
+                return nil
+            }
+
+            guard let result = await group.next() else { return nil }
+            group.cancelAll()
+            return result
+        }
+    }
+
+    @available(iOS 13.0.0, *)
     private func downloadSegmentAdvanced(
         segment: SegmentTask,
         playlistDir: URL,
@@ -402,11 +494,10 @@ class HighPerformanceHlsDownloader {
 
         let segmentFile = playlistDir.appendingPathComponent(segment.fileName)
 
-        // Check if file already exists and has content
+        // Check if file already exists
         if FileManager.default.fileExists(atPath: segmentFile.path) {
-            let attributes = try? FileManager.default.attributesOfItem(atPath: segmentFile.path)
-            if let size = attributes?[.size] as? Int64, size > 0 {
-                return size
+            if let fileSize = try? FileManager.default.attributesOfItem(atPath: segmentFile.path)[.size] as? Int64, fileSize > 0 {
+                return fileSize
             }
         }
 
@@ -427,8 +518,7 @@ class HighPerformanceHlsDownloader {
         }
     }
 
-    // MARK: - Streaming Download
-
+    @available(iOS 13.0.0, *)
     private func downloadSegmentStreaming(
         segment: SegmentTask,
         segmentFile: URL,
@@ -437,29 +527,26 @@ class HighPerformanceHlsDownloader {
     ) async throws -> Int64 {
 
         guard let url = URL(string: segment.url) else {
-            throw NSError(domain: "InvalidURL", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid segment URL"])
+            throw NSError(domain: "Invalid segment URL", code: -1)
         }
 
         var request = URLRequest(url: url)
-        request.timeoutInterval = 30
-
         for (key, value) in headers {
             request.setValue(value, forHTTPHeaderField: key)
         }
 
-        let (data, response) = try await urlSession.data(for: request)
+        let (data, response) = try await session.data(for: request)
 
         guard let httpResponse = response as? HTTPURLResponse,
               httpResponse.statusCode == 200 else {
-            throw NSError(domain: "DownloadError", code: -1, userInfo: [NSLocalizedDescriptionKey: "Download failed: \(segment.url)"])
+            throw NSError(domain: "Download failed: \(segment.url)", code: -1)
         }
 
         try data.write(to: segmentFile)
         return Int64(data.count)
     }
 
-    // MARK: - Chunked Download
-
+    @available(iOS 13.0.0, *)
     private func downloadSegmentChunked(
         segment: SegmentTask,
         segmentFile: URL,
@@ -467,7 +554,7 @@ class HighPerformanceHlsDownloader {
         config: AdaptiveConfig
     ) async throws -> Int64 {
 
-        // Get content length first
+        // Get content length
         guard let contentLength = try await getContentLength(url: segment.url, headers: headers) else {
             return try await downloadSegmentStreaming(
                 segment: segment,
@@ -486,113 +573,123 @@ class HighPerformanceHlsDownloader {
             )
         }
 
-        let chunks = (contentLength + Int64(config.chunkSize) - 1) / Int64(config.chunkSize)
+        let chunks = Int((contentLength + Int64(config.chunkSize) - 1) / Int64(config.chunkSize))
 
-        // Pre-allocate file
+        // Create file with proper size
         FileManager.default.createFile(atPath: segmentFile.path, contents: Data(count: Int(contentLength)))
-        let fileHandle = try FileHandle(forWritingTo: segmentFile)
-        defer { try? fileHandle.close() }
 
-        return try await withTaskGroup(of: (Int64, Data).self, returning: Int64.self) { group in
+        let fileHandle = try FileHandle(forWritingTo: segmentFile)
+        defer { fileHandle.closeFile() }
+
+        // Download chunks in parallel
+        try await withThrowingTaskGroup(of: (Int, Data).self) { group in
             for chunkIndex in 0..<chunks {
                 group.addTask {
-                    let start = chunkIndex * Int64(config.chunkSize)
+                    let start = Int64(chunkIndex) * Int64(config.chunkSize)
                     let end = min(start + Int64(config.chunkSize) - 1, contentLength - 1)
 
                     guard let url = URL(string: segment.url) else {
-                        throw NSError(domain: "InvalidURL", code: -1)
+                        throw NSError(domain: "Invalid URL", code: -1)
                     }
 
                     var request = URLRequest(url: url)
-                    request.setValue("bytes=\(start)-\(end)", forHTTPHeaderField: "Range")
-
                     for (key, value) in headers {
                         request.setValue(value, forHTTPHeaderField: key)
                     }
+                    request.setValue("bytes=\(start)-\(end)", forHTTPHeaderField: "Range")
 
-                    let (data, response) = try await self.urlSession.data(for: request)
+                    let (data, response) = try await self.session.data(for: request)
 
                     guard let httpResponse = response as? HTTPURLResponse,
                           httpResponse.statusCode == 206 else {
-                        throw NSError(domain: "ChunkError", code: -1)
+                        throw NSError(domain: "Chunk download failed", code: -1)
                     }
 
-                    return (start, data)
+                    return (chunkIndex, data)
                 }
             }
 
-            var totalBytes: Int64 = 0
-            for try await (offset, chunkData) in group {
-                try fileHandle.seek(toOffset: UInt64(offset))
-                try fileHandle.write(contentsOf: chunkData)
-                totalBytes += Int64(chunkData.count)
+            // Write chunks in order
+            for try await (chunkIndex, data) in group {
+                let offset = Int64(chunkIndex) * Int64(config.chunkSize)
+                fileHandle.seek(toFileOffset: UInt64(offset))
+                fileHandle.write(data)
             }
-
-            return totalBytes
         }
+
+        return contentLength
     }
 
-    // MARK: - Progress Handling
-
+    @available(iOS 13.0.0, *)
     private func handleProgressUpdates(
-        task: DownloadTask,
+        progressSubject: PassthroughSubject<ProgressUpdate, Never>,
+        task: inout MTDownloadTask,
         totalDownloadedBytes: AtomicInt64,
         downloadedSegments: AtomicInt,
         totalSegments: AtomicInt,
-        onProgress: @escaping ([String: Any]) -> Void,
-        isCompleted: AtomicBool
+        onProgress: @escaping ([String: Any]) -> Void
     ) async {
 
-        var lastUpdate: Int64 = 0
-        let updateInterval: Int64 = 300 // 300ms
+        var currentTask = task // local mutable copy
 
-        while !isCompleted.value {
-            let now = Int64(Date().timeIntervalSince1970 * 1000)
+        var lastUpdate: TimeInterval = 0
+        let updateInterval: TimeInterval = 0.3 // 300ms
+
+        let cancellable = progressSubject.sink { [weak self] update in
+            let now = Date().timeIntervalSince1970
 
             if now - lastUpdate >= updateInterval || downloadedSegments.value >= totalSegments.value {
-                task.downloadedBytes = totalDownloadedBytes.value
+                currentTask.downloadedBytes = totalDownloadedBytes.value
 
                 // Estimate total size if not known
-                if task.totalBytes <= 0 && downloadedSegments.value > 0 {
+                if currentTask.totalBytes <= 0 && downloadedSegments.value > 0 {
                     let avgBytesPerSegment = totalDownloadedBytes.value / Int64(downloadedSegments.value)
-                    task.totalBytes = avgBytesPerSegment * Int64(totalSegments.value)
+                    currentTask.totalBytes = avgBytesPerSegment * Int64(totalSegments.value)
                 }
 
-                sendProgress(for: task, onProgress: onProgress)
+                self?.sendProgress(task: &currentTask, onProgress: onProgress)
                 lastUpdate = now
             }
+        }
 
-            // Break if all segments downloaded
-            if downloadedSegments.value >= totalSegments.value && totalSegments.value > 0 {
-                break
-            }
-
+        // Keep the subscription alive
+        while downloadedSegments.value < totalSegments.value {
             try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
         }
+
+        cancellable.cancel()
+
+        // Copy back final state
+        task.downloadedBytes = currentTask.downloadedBytes
+        task.totalBytes = currentTask.totalBytes
     }
 
-    // MARK: - Performance Monitoring
-
+    @available(iOS 13.0.0, *)
     private func monitorPerformance(
         totalDownloadedBytes: AtomicInt64,
-        startTime: Int64,
-        isCompleted: AtomicBool
+        startTime: TimeInterval
     ) async {
 
-        while !isCompleted.value {
+        while true {
             try? await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
 
-            let currentTime = Int64(Date().timeIntervalSince1970 * 1000)
+            let currentTime = Date().timeIntervalSince1970
             let timeElapsed = currentTime - startTime
-            let currentSpeed = Double(totalDownloadedBytes.value) * 1000.0 / Double(timeElapsed)
+            let currentSpeed = Double(totalDownloadedBytes.value) * 1000.0 / timeElapsed
 
             metricsLock.lock()
-            performanceMetrics.updateSpeed(currentSpeed)
+            performanceMetrics.speedHistory.append(currentSpeed)
+            if performanceMetrics.speedHistory.count > 20 {
+                performanceMetrics.speedHistory.removeFirst()
+            }
+
+            performanceMetrics.avgDownloadSpeed = performanceMetrics.speedHistory.reduce(0, +) / Double(performanceMetrics.speedHistory.count)
+            performanceMetrics.lastSpeedUpdate = currentTime
             metricsLock.unlock()
         }
     }
 
-    // MARK: - Helper Methods
+    // MARK: - Utility Methods
 
     private func calculateSegmentPriority(index: Int, totalSegments: Int, variantIndex: Int) -> Int {
         let basePriority: Int
@@ -600,9 +697,9 @@ class HighPerformanceHlsDownloader {
         switch index {
         case 0..<5:
             basePriority = 100 - index // Highest priority for first segments
-        case 0..<Int(Double(totalSegments) * 0.1):
+        case 5..<Int(Double(totalSegments) * 0.1):
             basePriority = 80 - index // High priority for early segments
-        case 0..<Int(Double(totalSegments) * 0.3):
+        case Int(Double(totalSegments) * 0.1)..<Int(Double(totalSegments) * 0.3):
             basePriority = 60 // Medium priority
         default:
             basePriority = 40 // Normal priority
@@ -611,20 +708,22 @@ class HighPerformanceHlsDownloader {
         return basePriority - (variantIndex * 10) // Prefer higher quality variants
     }
 
+    @available(iOS 13.0.0, *)
     private func getContentLength(url: String, headers: [String: String]) async throws -> Int64? {
         guard let requestUrl = URL(string: url) else { return nil }
 
         var request = URLRequest(url: requestUrl)
         request.httpMethod = "HEAD"
-
         for (key, value) in headers {
             request.setValue(value, forHTTPHeaderField: key)
         }
 
         do {
-            let (_, response) = try await urlSession.data(for: request)
-            if let httpResponse = response as? HTTPURLResponse {
-                return Int64(httpResponse.expectedContentLength)
+            let (_, response) = try await session.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else { return nil }
+
+            if let contentLengthString = httpResponse.value(forHTTPHeaderField: "Content-Length") {
+                return Int64(contentLengthString)
             }
         } catch {
             return nil
@@ -633,28 +732,87 @@ class HighPerformanceHlsDownloader {
         return nil
     }
 
+    @available(iOS 13.0.0, *)
     private func fetchPlaylistContent(url: String, headers: [String: String]) async throws -> String {
+        // Validate URL format first
         guard let requestUrl = URL(string: url) else {
-            throw NSError(domain: "InvalidURL", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid playlist URL"])
+            throw NSError(domain: "Invalid URL format: \(url)", code: -1001)
+        }
+
+        // Check if this is actually an HLS URL
+        guard url.lowercased().contains(".m3u8") else {
+            throw NSError(domain: "Not an HLS playlist URL: \(url)", code: -1002)
+        }
+
+        // Avoid ISM (Smooth Streaming) URLs
+        if url.lowercased().contains(".ism") {
+            throw NSError(domain: "ISM format not supported: \(url)", code: -1003)
         }
 
         var request = URLRequest(url: requestUrl)
+        request.timeoutInterval = 30
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+
+        // Set User-Agent to avoid blocking
+        request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
+
         for (key, value) in headers {
             request.setValue(value, forHTTPHeaderField: key)
         }
 
-        let (data, response) = try await urlSession.data(for: request)
+        print("Fetching playlist from: \(url)")
+        let (data, response) = try await session.data(for: request)
 
-        guard let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 200 else {
-            throw NSError(domain: "PlaylistError", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to fetch playlist: \(url)"])
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw NSError(domain: "Invalid response type", code: -1004)
+        }
+
+        print("HTTP Status: \(httpResponse.statusCode) for URL: \(url)")
+
+        guard httpResponse.statusCode == 200 else {
+            let errorMessage = "HTTP \(httpResponse.statusCode): Failed to fetch playlist from \(url)"
+            throw NSError(domain: errorMessage, code: httpResponse.statusCode)
         }
 
         guard let content = String(data: data, encoding: .utf8) else {
-            throw NSError(domain: "EncodingError", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid playlist encoding"])
+            throw NSError(domain: "Invalid playlist encoding", code: -1005)
         }
 
+        guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw NSError(domain: "Empty playlist content", code: -1006)
+        }
+
+        // Validate that it's actually an M3U8 playlist
+        guard content.contains("#EXTM3U") else {
+            throw NSError(domain: "Invalid M3U8 format: Content does not contain #EXTM3U", code: -1007)
+        }
+
+        print("Successfully fetched playlist (\(content.count) characters)")
         return content
+    }
+
+    private func resolveURL(_ urlString: String, baseUri: URL) -> String {
+        // Handle absolute URLs
+        if urlString.hasPrefix("http://") || urlString.hasPrefix("https://") {
+            return urlString
+        }
+
+        // Handle relative URLs
+        if urlString.hasPrefix("/") {
+            // Root-relative URL
+            guard let scheme = baseUri.scheme, let host = baseUri.host else {
+                return baseUri.appendingPathComponent(urlString).absoluteString
+            }
+            var components = URLComponents()
+            components.scheme = scheme
+            components.host = host
+            components.port = baseUri.port
+            components.path = urlString
+            return components.url?.absoluteString ?? baseUri.appendingPathComponent(urlString).absoluteString
+        } else {
+            // Path-relative URL
+            return baseUri.appendingPathComponent(urlString).absoluteString
+        }
     }
 
     private func parseMasterPlaylist(content: String, baseUri: URL) -> [VariantPlaylist] {
@@ -667,30 +825,44 @@ class HighPerformanceHlsDownloader {
             let line = lines[i].trimmingCharacters(in: .whitespaces)
 
             if line.hasPrefix("#EXT-X-STREAM-INF:") {
-                // Parse bandwidth
-                if let bandwidthMatch = line.range(of: "BANDWIDTH=(\\d+)", options: .regularExpression) {
-                    let bandwidthString = String(line[bandwidthMatch]).replacingOccurrences(of: "BANDWIDTH=", with: "")
-                    currentBandwidth = Int64(bandwidthString) ?? 0
+                // Extract bandwidth with better regex
+                if let bandwidthRange = line.range(of: "BANDWIDTH=(\\d+)", options: .regularExpression) {
+                    let bandwidthStr = String(line[bandwidthRange]).replacingOccurrences(of: "BANDWIDTH=", with: "")
+                    currentBandwidth = Int64(bandwidthStr) ?? 0
                 }
 
-                // Parse resolution
-                if let resolutionMatch = line.range(of: "RESOLUTION=(\\d+x\\d+)", options: .regularExpression) {
-                    currentResolution = String(line[resolutionMatch]).replacingOccurrences(of: "RESOLUTION=", with: "")
+                // Extract resolution with better regex
+                if let resolutionRange = line.range(of: "RESOLUTION=(\\d+x\\d+)", options: .regularExpression) {
+                    currentResolution = String(line[resolutionRange]).replacingOccurrences(of: "RESOLUTION=", with: "")
                 }
 
             } else if !line.isEmpty && !line.hasPrefix("#") {
-                let variantUrl = baseUri.appendingPathComponent(line).absoluteString
-                let variantFileName = String(line.split(separator: "/").last ?? "")
-                variants.append(VariantPlaylist(
-                    url: variantUrl,
-                    fileName: variantFileName,
-                    bandwidth: currentBandwidth,
-                    resolution: currentResolution
-                ))
+                // Resolve the variant URL properly
+                let variantUrl = resolveURL(line, baseUri: baseUri)
+                let variantFileName = URL(string: line)?.lastPathComponent ?? line
+
+                // Validate the variant URL
+                if variantUrl.lowercased().contains(".m3u8") {
+                    variants.append(VariantPlaylist(
+                        url: variantUrl,
+                        fileName: variantFileName,
+                        bandwidth: currentBandwidth,
+                        resolution: currentResolution
+                    ))
+                    print("Found variant: \(variantUrl) (bandwidth: \(currentBandwidth))")
+                } else {
+                    print("Skipping non-M3U8 variant: \(variantUrl)")
+                }
+
+                // Reset for next variant
+                currentBandwidth = 0
+                currentResolution = ""
             }
         }
 
-        return variants.sorted { $0.bandwidth > $1.bandwidth }
+        let sortedVariants = variants.sorted { $0.bandwidth > $1.bandwidth }
+        print("Parsed \(sortedVariants.count) valid variants from master playlist")
+        return sortedVariants
     }
 
     private func parseVariantPlaylist(content: String, baseUri: URL, variantName: String) -> [SegmentTask] {
@@ -702,37 +874,38 @@ class HighPerformanceHlsDownloader {
             let line = lines[i].trimmingCharacters(in: .whitespaces)
 
             if line.hasPrefix("#EXTINF:") {
+                // Enhanced duration parsing
                 if let durationMatch = line.range(of: "#EXTINF:([\\d.]+)", options: .regularExpression) {
-                    let durationString = String(line[durationMatch]).replacingOccurrences(of: "#EXTINF:", with: "").replacingOccurrences(of: ",", with: "")
-                    segmentDuration = Double(durationString) ?? 10.0
+                    let durationStr = String(line[durationMatch])
+                        .replacingOccurrences(of: "#EXTINF:", with: "")
+                        .components(separatedBy: ",")[0]
+                    segmentDuration = Double(durationStr) ?? 10.0
                 }
             } else if !line.isEmpty && !line.hasPrefix("#") {
-                let segmentUrl = baseUri.appendingPathComponent(line).absoluteString
-                let segmentFileName = "\(variantName)_\(String(line.split(separator: "/").last ?? ""))"
+                // Resolve segment URL properly
+                let segmentUrl = resolveURL(line, baseUri: baseUri)
+                let originalFileName = URL(string: line)?.lastPathComponent ?? line
+                let segmentFileName = "\(variantName)_\(originalFileName)"
+
                 segments.append(SegmentTask(
                     url: segmentUrl,
                     fileName: segmentFileName,
-                    size: 0,
-                    downloaded: false,
-                    bytes: 0,
                     duration: segmentDuration
                 ))
             }
         }
 
+        print("Parsed \(segments.count) segments from variant playlist")
         return segments
     }
 
     private func createLocalPlaylist(variant: VariantPlaylist, segments: [SegmentTask], playlistDir: URL) throws {
+        var playlistContent = "#EXTM3U\n"
+        playlistContent += "#EXT-X-VERSION:3\n"
+
         let maxDuration = segments.map { Int($0.duration) }.max() ?? 10
-
-        var playlistContent = """
-        #EXTM3U
-        #EXT-X-VERSION:3
-        #EXT-X-TARGETDURATION:\(maxDuration)
-        #EXT-X-MEDIA-SEQUENCE:0
-
-        """
+        playlistContent += "#EXT-X-TARGETDURATION:\(maxDuration)\n"
+        playlistContent += "#EXT-X-MEDIA-SEQUENCE:0\n"
 
         for segment in segments {
             playlistContent += "#EXTINF:\(segment.duration),\n"
@@ -746,11 +919,8 @@ class HighPerformanceHlsDownloader {
     }
 
     private func createMasterPlaylist(variants: [VariantPlaylist], playlistDir: URL) throws {
-        var masterContent = """
-        #EXTM3U
-        #EXT-X-VERSION:3
-
-        """
+        var masterContent = "#EXTM3U\n"
+        masterContent += "#EXT-X-VERSION:3\n"
 
         for variant in variants {
             var streamInf = "BANDWIDTH=\(variant.bandwidth)"
@@ -765,10 +935,10 @@ class HighPerformanceHlsDownloader {
         try masterContent.write(to: masterFile, atomically: true, encoding: .utf8)
     }
 
-    private func sendProgress(for task: DownloadTask, onProgress: @escaping ([String: Any]) -> Void) {
-        let currentTime = Int64(Date().timeIntervalSince1970 * 1000)
-        let timeElapsed = max(1, currentTime - task.startTime)
-        let currentSpeed = Double(task.downloadedBytes) * 1000.0 / Double(timeElapsed)
+    private func sendProgress(task: inout MTDownloadTask, onProgress: ([String: Any]) -> Void) {
+        let currentTime = Date().timeIntervalSince1970
+        let timeElapsed = max(1.0, currentTime - task.startTime)
+        let currentSpeed = Double(task.downloadedBytes) * 1000.0 / timeElapsed
 
         task.speedHistory.append(currentSpeed)
         if task.speedHistory.count > 10 {
@@ -777,12 +947,12 @@ class HighPerformanceHlsDownloader {
 
         let avgSpeed = task.speedHistory.isEmpty ? currentSpeed : task.speedHistory.reduce(0, +) / Double(task.speedHistory.count)
 
-        let progress = task.totalBytes > 0 ? Int((Double(task.downloadedBytes) * 100.0) / Double(task.totalBytes)) : -1
+        let progress = task.totalBytes > 0 ? Int((Double(task.downloadedBytes) * 100.0 / Double(task.totalBytes))) : -1
 
         let remainingBytes = task.totalBytes - task.downloadedBytes
-        let estimatedTimeRemaining = (avgSpeed > 0 && remainingBytes > 0) ? Int64(Double(remainingBytes) / avgSpeed * 1000) : -1
+        let estimatedTimeRemaining = avgSpeed > 0 && remainingBytes > 0 ? Int64(Double(remainingBytes) / avgSpeed * 1000) : -1
 
-        let progressData: [String: Any] = [
+        onProgress([
             "url": task.url,
             "filePath": task.filePath,
             "progress": progress,
@@ -792,59 +962,25 @@ class HighPerformanceHlsDownloader {
             "error": task.error ?? "",
             "speed": avgSpeed,
             "estimatedTimeRemaining": estimatedTimeRemaining
-        ]
-
-        DispatchQueue.main.async {
-            onProgress(progressData)
-        }
+        ])
     }
 
     // MARK: - Cleanup
 
     func cleanup() {
-        urlSession.invalidateAndCancel()
+        session.invalidateAndCancel()
+        operationQueue.cancelAllOperations()
     }
 }
 
 // MARK: - Atomic Types
 
-private class AtomicInt64 {
-    private var _value: Int64 = 0
-    private let lock = NSLock()
-
-    init(_ initialValue: Int64 = 0) {
-        _value = initialValue
-    }
-
-    var value: Int64 {
-        lock.lock()
-        defer { lock.unlock() }
-        return _value
-    }
-
-    func setValue(_ newValue: Int64) {
-        lock.lock()
-        defer { lock.unlock() }
-        _value = newValue
-    }
-
-    func add(_ amount: Int64) {
-        lock.lock()
-        defer { lock.unlock() }
-        _value += amount
-    }
-
-    func increment() {
-        add(1)
-    }
-}
-
-private class AtomicInt {
+class AtomicInt {
     private var _value: Int = 0
     private let lock = NSLock()
 
-    init(_ initialValue: Int = 0) {
-        _value = initialValue
+    init(_ value: Int = 0) {
+        _value = value
     }
 
     var value: Int {
@@ -853,29 +989,56 @@ private class AtomicInt {
         return _value
     }
 
-    func setValue(_ newValue: Int) {
-        lock.lock()
-        defer { lock.unlock() }
-        _value = newValue
-    }
-
     func add(_ amount: Int) {
         lock.lock()
-        defer { lock.unlock() }
         _value += amount
+        lock.unlock()
     }
 
     func increment() {
         add(1)
     }
+
+    func setValue(_ newValue: Int) {
+        lock.lock()
+        _value = newValue
+        lock.unlock()
+    }
 }
 
-private class AtomicBool {
+class AtomicInt64 {
+    private var _value: Int64 = 0
+    private let lock = NSLock()
+
+    init(_ value: Int64 = 0) {
+        _value = value
+    }
+
+    var value: Int64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return _value
+    }
+
+    func add(_ amount: Int64) {
+        lock.lock()
+        _value += amount
+        lock.unlock()
+    }
+
+    func setValue(_ newValue: Int64) {
+        lock.lock()
+        _value = newValue
+        lock.unlock()
+    }
+}
+
+class AtomicBool {
     private var _value: Bool = false
     private let lock = NSLock()
 
-    init(_ initialValue: Bool = false) {
-        _value = initialValue
+    init(_ value: Bool = false) {
+        _value = value
     }
 
     var value: Bool {
@@ -886,261 +1049,7 @@ private class AtomicBool {
 
     func setValue(_ newValue: Bool) {
         lock.lock()
-        defer { lock.unlock() }
         _value = newValue
-    }
-}
-
-// MARK: - Priority Queue
-
-private class PriorityQueue<Element: Comparable> {
-    private var elements: [Element] = []
-    private let lock = NSLock()
-
-    var isEmpty: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return elements.isEmpty
-    }
-
-    var count: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return elements.count
-    }
-
-    func enqueue(_ element: Element) {
-        lock.lock()
-        defer { lock.unlock() }
-
-        elements.append(element)
-        elements.sort() // Keep sorted for priority order
-    }
-
-    func dequeue() -> Element? {
-        lock.lock()
-        defer { lock.unlock() }
-
-        guard !elements.isEmpty else { return nil }
-        return elements.removeFirst()
-    }
-
-    func peek() -> Element? {
-        lock.lock()
-        defer { lock.unlock() }
-        return elements.first
-    }
-
-    func clear() {
-        lock.lock()
-        defer { lock.unlock() }
-        elements.removeAll()
-    }
-}
-
-// MARK: - AsyncSemaphore (Enhanced)
-
-actor AsyncSemaphore {
-    private var count: Int
-    private var waiters: [CheckedContinuation<Void, Never>] = []
-
-    init(value: Int) {
-        self.count = value
-    }
-
-    func wait() async {
-        if count > 0 {
-            count -= 1
-        } else {
-            await withCheckedContinuation { continuation in
-                waiters.append(continuation)
-            }
-        }
-    }
-
-    func signal() {
-        if waiters.isEmpty {
-            count += 1
-        } else {
-            let waiter = waiters.removeFirst()
-            waiter.resume()
-        }
-    }
-
-    func getValue() -> Int {
-        return count
-    }
-}
-
-// MARK: - Enhanced HTTP Client for iOS
-
-extension HighPerformanceHlsDownloader {
-
-    private func createOptimizedURLSession() -> URLSession {
-        let configuration = URLSessionConfiguration.default
-
-        // Connection settings
-        configuration.httpMaximumConnectionsPerHost = 20
-        configuration.timeoutIntervalForRequest = 10
-        configuration.timeoutIntervalForResource = 300
-
-        // Cache settings
-        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-        configuration.urlCache = nil
-
-        // Performance settings
-        configuration.shouldUseExtendedBackgroundIdleMode = true
-        configuration.networkServiceType = .video // Optimize for video content
-
-        // HTTP settings
-        configuration.httpShouldUsePipelining = true
-        configuration.httpShouldSetCookies = false
-
-        return URLSession(configuration: configuration)
-    }
-}
-
-// MARK: - Network Monitoring (iOS Specific)
-
-extension HighPerformanceHlsDownloader {
-
-    private func setupNetworkMonitoring() {
-        let monitor = NWPathMonitor()
-        let queue = DispatchQueue(label: "NetworkMonitor")
-
-        monitor.pathUpdateHandler = { [weak self] path in
-            guard let self = self else { return }
-
-            self.configLock.lock()
-            defer { self.configLock.unlock() }
-
-            if path.status == .satisfied {
-                if path.isExpensive {
-                    // Cellular connection - reduce concurrent downloads
-                    self.config.concurrentDownloaders = min(self.config.concurrentDownloaders, 8)
-                    self.config.maxConnections = min(self.config.maxConnections, 12)
-                } else {
-                    // WiFi connection - can use more resources
-                    self.config.concurrentDownloaders = min(self.config.concurrentDownloaders + 2, 20)
-                    self.config.maxConnections = min(self.config.maxConnections + 5, 30)
-                }
-            }
-        }
-
-        monitor.start(queue: queue)
-    }
-}
-
-// MARK: - Error Handling Extensions
-
-extension HighPerformanceHlsDownloader {
-
-    enum DownloadError: Error, LocalizedError {
-        case invalidURL(String)
-        case networkError(String)
-        case fileSystemError(String)
-        case parsingError(String)
-        case timeoutError
-        case insufficientStorage
-
-        var errorDescription: String? {
-            switch self {
-            case .invalidURL(let url):
-                return "Invalid URL: \(url)"
-            case .networkError(let message):
-                return "Network error: \(message)"
-            case .fileSystemError(let message):
-                return "File system error: \(message)"
-            case .parsingError(let message):
-                return "Parsing error: \(message)"
-            case .timeoutError:
-                return "Download timeout"
-            case .insufficientStorage:
-                return "Insufficient storage space"
-            }
-        }
-    }
-
-    private func handleDownloadError(_ error: Error, for segment: SegmentTask) -> Error {
-        if let urlError = error as? URLError {
-            switch urlError.code {
-            case .timedOut:
-                return DownloadError.timeoutError
-            case .notConnectedToInternet, .networkConnectionLost:
-                return DownloadError.networkError("No internet connection")
-            case .cannotFindHost, .cannotConnectToHost:
-                return DownloadError.networkError("Cannot connect to server")
-            default:
-                return DownloadError.networkError(urlError.localizedDescription)
-            }
-        }
-
-        return error
-    }
-}
-
-// MARK: - Performance Optimization Extensions
-
-extension HighPerformanceHlsDownloader {
-
-    private func optimizeForSegmentSize(_ segmentSize: Int64) {
-        configLock.lock()
-        defer { configLock.unlock() }
-
-        switch segmentSize {
-        case 0...50_000: // Very small segments
-            config.concurrentDownloaders = 25
-            config.bufferSize = 4096
-            config.useChunking = false
-
-        case 50_001...200_000: // Small segments
-            config.concurrentDownloaders = 20
-            config.bufferSize = 8192
-            config.useChunking = false
-
-        case 200_001...1_000_000: // Medium segments
-            config.concurrentDownloaders = 15
-            config.bufferSize = 16384
-            config.useChunking = false
-
-        case 1_000_001...5_000_000: // Large segments
-            config.concurrentDownloaders = 10
-            config.bufferSize = 32768
-            config.useChunking = true
-            config.chunkSize = 512_000
-
-        default: // Very large segments
-            config.concurrentDownloaders = 8
-            config.bufferSize = 65536
-            config.useChunking = true
-            config.chunkSize = 1_000_000
-        }
-    }
-
-    private func adaptToNetworkConditions() {
-        metricsLock.lock()
-        let metrics = performanceMetrics
-        metricsLock.unlock()
-
-        configLock.lock()
-        defer { configLock.unlock() }
-
-        if metrics.avgDownloadSpeed > 0 {
-            let speedMBps = metrics.avgDownloadSpeed / (1024 * 1024)
-
-            switch speedMBps {
-            case 0...1: // Slow connection
-                config.concurrentDownloaders = min(config.concurrentDownloaders, 5)
-                config.maxConnections = min(config.maxConnections, 8)
-
-            case 1...5: // Medium connection
-                config.concurrentDownloaders = min(config.concurrentDownloaders, 12)
-                config.maxConnections = min(config.maxConnections, 18)
-
-            default: // Fast connection
-                config.concurrentDownloaders = min(config.concurrentDownloaders + 2, 25)
-                config.maxConnections = min(config.maxConnections + 5, 35)
-            }
-        }
+        lock.unlock()
     }
 }

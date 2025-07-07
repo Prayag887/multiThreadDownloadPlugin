@@ -233,15 +233,25 @@ class DownloadProgress {
   });
 
   factory DownloadProgress.fromMap(Map<String, dynamic> map) {
+    print('=== DEBUG fromMap ===');
+    print('Full map: $map');
+
+    // Check each field that could cause the error
+    ['progress', 'bytesDownloaded', 'totalBytes', 'status'].forEach((key) {
+      final value = map[key];
+      print('$key: "$value" (type: ${value.runtimeType})');
+    });
+    print('====================');
+
     return DownloadProgress(
-      url: map['url'] ?? '',
-      filePath: map['filePath'] ?? '',
-      progress: map['progress'] ?? 0,
-      bytesDownloaded: map['bytesDownloaded'] ?? 0,
-      totalBytes: map['totalBytes'] ?? 0,
-      status: DownloadStatus.values[map['status'] ?? 0],
-      error: map['error'],
-      speed: (map['speed'] ?? 0.0).toDouble(),
+      url: map['url']?.toString() ?? '',
+      filePath: map['filePath']?.toString() ?? '',
+      progress: (map['progress'] as num?)?.toInt() ?? 0,      // Line 241
+      bytesDownloaded: (map['bytesDownloaded'] as num?)?.toInt() ?? 0,  // Line 242
+      totalBytes: (map['totalBytes'] as num?)?.toInt() ?? 0,           // Line 243
+      status: DownloadStatus.values[(map['status'] as num?)?.toInt() ?? 0],
+      error: map['error']?.toString(),
+      speed: (map['speed'] as num?)?.toDouble() ?? 0.0,
     );
   }
 

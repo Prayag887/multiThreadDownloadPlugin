@@ -132,4 +132,4 @@ class HttpsDownloader {
             "speed" to avgSpeed
         ))
     }
-}`
+}
