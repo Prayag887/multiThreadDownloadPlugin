@@ -1,6 +1,6 @@
 import Foundation
 
-@available(iOS 13.0, *)
+@available(iOS 15.0, *)
 class ParallelDownloadManager {
     
     private var downloads: [String: MTDownloadTask] = [:]
@@ -13,6 +13,7 @@ class ParallelDownloadManager {
     private let httpsDownloader = HttpsDownloader()
     private let hlsDownloader = HighPerformanceHlsDownloader()
     
+    @available(iOS 15.0, *)
     func startBatchDownload(
         urls: [String],
         basePath: String,
@@ -73,7 +74,7 @@ class ParallelDownloadManager {
                             var task = originalTask
 
                             if task.url.lowercased().hasSuffix(".m3u8") {
-                                try await self?.hlsDownloader.downloadHlsStreamAdvanced(task: &task, basePath: basePath, onProgress: onProgress)
+                                try await self?.hlsDownloader.downloadHlsStreamAdvanced(task: task, basePath: basePath, onProgress: onProgress)
                             } else {
                                 try await self?.httpsDownloader.downloadSingleFile(task: task, onProgress: onProgress)
                             }
@@ -235,7 +236,7 @@ class ParallelDownloadManager {
                     if task.url.lowercased().hasSuffix(".m3u8") {
                         let basePath = URL(fileURLWithPath: task.filePath).deletingLastPathComponent().path
                         try await self?.hlsDownloader.downloadHlsStreamAdvanced(
-                            task: &task,
+                            task: task,
                             basePath: basePath,
                             onProgress: onProgress
                         )
@@ -320,7 +321,7 @@ class ParallelDownloadManager {
                         if task.url.lowercased().hasSuffix(".m3u8") {
                             let basePath = URL(fileURLWithPath: task.filePath).deletingLastPathComponent().path
                             try await self?.hlsDownloader.downloadHlsStreamAdvanced(
-                                task: &task,
+                                task: task,
                                 basePath: basePath,
                                 onProgress: onProgress
                             )
@@ -405,7 +406,7 @@ class ParallelDownloadManager {
                         if task.url.lowercased().hasSuffix(".m3u8") {
                             let basePath = URL(fileURLWithPath: task.filePath).deletingLastPathComponent().path
                             try await self?.hlsDownloader.downloadHlsStreamAdvanced(
-                                task: &task,
+                                task: task,
                                 basePath: basePath,
                                 onProgress: onProgress
                             )

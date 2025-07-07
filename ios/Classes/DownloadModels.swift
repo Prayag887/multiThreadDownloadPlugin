@@ -2,10 +2,10 @@ import Foundation
 
 @available(iOS 13.0, *)
 struct MTDownloadTask {
-    let url: String
+    var url: String
     var filePath: String
-    let fileName: String
-    let headers: [String: String]
+    var fileName: String
+    var headers: [String: String]
     var retryCount: Int = 3
     var totalBytes: Int64 = 0
     var downloadedBytes: Int64 = 0
