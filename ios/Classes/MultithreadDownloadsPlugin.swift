@@ -1,16 +1,44 @@
-// ios/Classes/MultithreadedDownloadsPlugin.swift
 import Flutter
-import Foundation
+import UIKit
 
-public class MultithreadedDownloadsPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
+public class MultithreadDownloadsPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
+    private var channel: FlutterMethodChannel?
+    private var eventChannel: FlutterEventChannel?
     private var eventSink: FlutterEventSink?
-    private let downloadManager = DownloadManager()
+    
+    private let downloadManager = ParallelDownloadManager()
+    private var downloadQueue = Queue<DownloadRequest>()
+    private var isProcessingQueue = false
+    private let queueLock = NSLock()
+    
+    struct DownloadRequest {
+        let urls: [String]
+        let filePath: String
+        let headers: [String: String]
+        let maxConcurrentTasks: Int
+        let retryCount: Int
+        let timeoutSeconds: Int
+        let requestId: String
+        
+        init(urls: [String], filePath: String, headers: [String: String], 
+             maxConcurrentTasks: Int, retryCount: Int, timeoutSeconds: Int) {
+            self.urls = urls
+            self.filePath = filePath
+            self.headers = headers
+            self.maxConcurrentTasks = maxConcurrentTasks
+            self.retryCount = retryCount
+            self.timeoutSeconds = timeoutSeconds
+            self.requestId = String(Int(Date().timeIntervalSince1970 * 1000))
+        }
+    }
     
     public static func register(with registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(name: "multithread_downloads", binaryMessenger: registrar.messenger())
         let eventChannel = FlutterEventChannel(name: "multithread_downloads/progress", binaryMessenger: registrar.messenger())
+        let instance = MultithreadDownloadsPlugin()
+        instance.channel = channel
+        instance.eventChannel = eventChannel
         
-        let instance = MultithreadedDownloadsPlugin()
         registrar.addMethodCallDelegate(instance, channel: channel)
         eventChannel.setStreamHandler(instance)
     }
@@ -18,80 +46,251 @@ public class MultithreadedDownloadsPlugin: NSObject, FlutterPlugin, FlutterStrea
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         switch call.method {
         case "startDownload":
-            guard let args = call.arguments as? [String: Any],
-                  let url = args["url"] as? String,
-                  let filePath = args["filePath"] as? String else {
-                result(FlutterError(code: "INVALID_ARGUMENTS", message: "Missing required arguments", details: nil))
-                return
-            }
-            
-            let headers = args["headers"] as? [String: String] ?? [:]
-            let maxConcurrentTasks = args["maxConcurrentTasks"] as? Int ?? 4
-            let chunkSize = args["chunkSize"] as? Int ?? (1024 * 1024)
-            let retryCount = args["retryCount"] as? Int ?? 3
-            let timeoutSeconds = args["timeoutSeconds"] as? Int ?? 30
-            
-            downloadManager.startDownload(
-                url: url,
-                filePath: filePath,
-                headers: headers,
-                maxConcurrentTasks: maxConcurrentTasks,
-                chunkSize: chunkSize,
-                retryCount: retryCount,
-                timeoutSeconds: timeoutSeconds
-            ) { [weak self] progress in
-                self?.sendProgress(progress)
-            }
-            result(true)
-            
+            handleStartDownload(call, result: result)
         case "pauseDownload":
-            guard let args = call.arguments as? [String: Any],
-                  let url = args["url"] as? String else {
-                result(false)
-                return
-            }
-            result(downloadManager.pauseDownload(url: url))
-            
+            handlePauseDownload(call, result: result)
         case "resumeDownload":
-            guard let args = call.arguments as? [String: Any],
-                  let url = args["url"] as? String else {
-                result(false)
-                return
-            }
-            downloadManager.resumeDownload(url: url) { [weak self] progress in
+            handleResumeDownload(call, result: result)
+        case "cancelDownload":
+            handleCancelDownload(call, result: result)
+        case "pauseAllDownloads":
+            result(downloadManager.pauseAllDownloads())
+        case "resumeAllDownloads":
+            downloadManager.resumeAllDownloads { [weak self] progress in
                 self?.sendProgress(progress)
             }
             result(true)
-            
-        case "cancelDownload":
-            guard let args = call.arguments as? [String: Any],
-                  let url = args["url"] as? String else {
-                result(false)
-                return
-            }
-            result(downloadManager.cancelDownload(url: url))
-            
+        case "cancelAllDownloads":
+            let cancelled = downloadManager.cancelAllDownloads()
+            clearQueue()
+            result(cancelled)
+        case "pauseDownloads":
+            handlePauseDownloads(call, result: result)
+        case "resumeDownloads":
+            handleResumeDownloads(call, result: result)
+        case "cancelDownloads":
+            handleCancelDownloads(call, result: result)
         case "getDownloadStatus":
-            guard let args = call.arguments as? [String: Any],
-                  let url = args["url"] as? String else {
-                result(nil)
-                return
-            }
-            result(downloadManager.getDownloadStatus(url: url))
-            
+            handleGetDownloadStatus(call, result: result)
+        case "getDownloadStatuses":
+            handleGetDownloadStatuses(call, result: result)
         case "getAllDownloads":
             result(downloadManager.getAllDownloads())
-            
+        case "getBatchProgress":
+            result(downloadManager.getBatchProgress())
         case "clearCompletedDownloads":
             result(downloadManager.clearCompletedDownloads())
-            
+        case "getQueueSize":
+            result(downloadQueue.count)
+        case "getQueueStatus":
+            result(getQueueStatus())
+        case "clearQueue":
+            clearQueue()
+            result(true)
         default:
             result(FlutterMethodNotImplemented)
         }
     }
     
+    private func handleStartDownload(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+        guard let args = call.arguments as? [String: Any],
+              let urls = args["urls"] as? [String],
+              let filePath = args["filePath"] as? String else {
+            result(FlutterError(code: "INVALID_ARGUMENTS", message: "Invalid arguments", details: nil))
+            return
+        }
+        
+        let headers = args["headers"] as? [String: String] ?? [:]
+        let maxConcurrentTasks = args["maxConcurrentTasks"] as? Int ?? 50
+        let retryCount = args["retryCount"] as? Int ?? 3
+        let timeoutSeconds = args["timeoutSeconds"] as? Int ?? 30
+        
+        print("headers::: \(headers)")
+        
+        let downloadRequest = DownloadRequest(
+            urls: urls,
+            filePath: filePath,
+            headers: headers,
+            maxConcurrentTasks: maxConcurrentTasks,
+            retryCount: retryCount,
+            timeoutSeconds: timeoutSeconds
+        )
+        
+        downloadQueue.enqueue(downloadRequest)
+        print("Added download request to queue. Queue size: \(downloadQueue.count)")
+        
+        sendQueueStatus()
+        processDownloadQueue()
+        
+        result([
+            "success": true,
+            "queueSize": downloadQueue.count,
+            "isProcessing": isProcessingQueue
+        ])
+    }
+    
+    private func handlePauseDownload(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+        guard let args = call.arguments as? [String: Any],
+              let url = args["url"] as? String else {
+            result(false)
+            return
+        }
+        result(downloadManager.pauseDownload(url))
+    }
+    
+    private func handleResumeDownload(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+        guard let args = call.arguments as? [String: Any],
+              let url = args["url"] as? String else {
+            result(false)
+            return
+        }
+        downloadManager.resumeDownload(url) { [weak self] progress in
+            self?.sendProgress(progress)
+        }
+        result(true)
+    }
+    
+    private func handleCancelDownload(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+        guard let args = call.arguments as? [String: Any],
+              let url = args["url"] as? String else {
+            result(false)
+            return
+        }
+        result(downloadManager.cancelDownload(url))
+    }
+    
+    private func handlePauseDownloads(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+        guard let args = call.arguments as? [String: Any],
+              let urls = args["urls"] as? [String] else {
+            result(false)
+            return
+        }
+        result(downloadManager.pauseDownloads(urls))
+    }
+    
+    private func handleResumeDownloads(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+        guard let args = call.arguments as? [String: Any],
+              let urls = args["urls"] as? [String] else {
+            result(false)
+            return
+        }
+        downloadManager.resumeDownloads(urls) { [weak self] progress in
+            self?.sendProgress(progress)
+        }
+        result(true)
+    }
+    
+    private func handleCancelDownloads(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+        guard let args = call.arguments as? [String: Any],
+              let urls = args["urls"] as? [String] else {
+            result(false)
+            return
+        }
+        result(downloadManager.cancelDownloads(urls))
+    }
+    
+    private func handleGetDownloadStatus(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+        guard let args = call.arguments as? [String: Any],
+              let url = args["url"] as? String else {
+            result(nil)
+            return
+        }
+        result(downloadManager.getDownloadStatus(url))
+    }
+    
+    private func handleGetDownloadStatuses(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+        guard let args = call.arguments as? [String: Any],
+              let urls = args["urls"] as? [String] else {
+            result([])
+            return
+        }
+        result(downloadManager.getDownloadStatuses(urls))
+    }
+    
+    private func processDownloadQueue() {
+        queueLock.lock()
+        defer { queueLock.unlock() }
+        
+        if isProcessingQueue || downloadQueue.isEmpty {
+            return
+        }
+        
+        if !downloadManager.isReadyForNewBatch() {
+            print("Download manager not ready for new batch, waiting...")
+            return
+        }
+        
+        isProcessingQueue = true
+        
+        guard let request = downloadQueue.dequeue() else {
+            isProcessingQueue = false
+            return
+        }
+        
+        print("Processing download request with \(request.urls.count) URLs")
+        
+        downloadManager.startBatchDownload(
+            urls: request.urls,
+            filePath: request.filePath,
+            headers: request.headers,
+            maxConcurrentTasks: request.maxConcurrentTasks,
+            retryCount: request.retryCount,
+            timeoutSeconds: request.timeoutSeconds,
+            onProgress: { [weak self] progress in
+                self?.sendProgress(progress)
+            },
+            onBatchComplete: { [weak self] in
+                print("Batch completed, processing next item in queue")
+                self?.queueLock.lock()
+                self?.isProcessingQueue = false
+                self?.queueLock.unlock()
+                
+                self?.sendQueueStatus()
+                
+                // Small delay to ensure cleanup is complete before processing next batch
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    self?.processDownloadQueue()
+                }
+            }
+        )
+        
+        sendQueueStatus()
+    }
+    
+    private func getQueueStatus() -> [String: Any] {
+        return [
+            "queueSize": downloadQueue.count,
+            "isProcessing": isProcessingQueue,
+            "isBatchActive": downloadManager.isBatchActive(),
+            "currentBatchComplete": downloadManager.isBatchComplete(),
+            "isReadyForNewBatch": downloadManager.isReadyForNewBatch()
+        ]
+    }
+    
+    private func sendQueueStatus() {
+        var queueStatus = getQueueStatus()
+        queueStatus["isQueueStatus"] = true
+        sendProgress(queueStatus)
+    }
+    
+    private func clearQueue() {
+        queueLock.lock()
+        downloadQueue.clear()
+        isProcessingQueue = false
+        queueLock.unlock()
+        sendQueueStatus()
+    }
+    
+    private func sendProgress(_ progress: [String: Any]) {
+        DispatchQueue.main.async { [weak self] in
+            self?.eventSink?(progress)
+        }
+    }
+    
+    // MARK: - FlutterStreamHandler
     public func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
         self.eventSink = events
+        sendQueueStatus()
         return nil
     }
     
@@ -100,455 +299,383 @@ public class MultithreadedDownloadsPlugin: NSObject, FlutterPlugin, FlutterStrea
         return nil
     }
     
-    private func sendProgress(_ progress: [String: Any]) {
-        DispatchQueue.main.async {
-            self.eventSink?(progress)
-        }
+    deinit {
+        downloadManager.cancelAllDownloads()
+        clearQueue()
     }
 }
 
-// MARK: - Download Manager
-class DownloadManager {
-    private var downloads: [String: DownloadTask] = [:]
-    private let downloadQueue = DispatchQueue(label: "download.queue", attributes: .concurrent)
-    private let session: URLSession
+// MARK: - Queue Implementation
+class Queue<T> {
+    private var items: [T] = []
+    private let lock = NSLock()
+    
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return items.count
+    }
+    
+    var isEmpty: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return items.isEmpty
+    }
+    
+    func enqueue(_ item: T) {
+        lock.lock()
+        defer { lock.unlock() }
+        items.append(item)
+    }
+    
+    func dequeue() -> T? {
+        lock.lock()
+        defer { lock.unlock() }
+        return items.isEmpty ? nil : items.removeFirst()
+    }
+    
+    func clear() {
+        lock.lock()
+        defer { lock.unlock() }
+        items.removeAll()
+    }
+}
+
+// MARK: - ParallelDownloadManager
+class ParallelDownloadManager {
+    private var downloadTasks: [String: URLSessionDownloadTask] = [:]
+    private var downloadStatuses: [String: [String: Any]] = [:]
+    private let lock = NSLock()
+    private var urlSession: URLSession?
+    private var batchActive = false
+    private var batchComplete = false
+    private var currentBatchUrls: [String] = []
     
     init() {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 30
         config.timeoutIntervalForResource = 300
-        self.session = URLSession(configuration: config)
+        urlSession = URLSession(configuration: config, delegate: nil, delegateQueue: nil)
     }
     
-    func startDownload(
-        url: String,
+    func startBatchDownload(
+        urls: [String],
         filePath: String,
         headers: [String: String],
         maxConcurrentTasks: Int,
-        chunkSize: Int,
         retryCount: Int,
         timeoutSeconds: Int,
-        onProgress: @escaping ([String: Any]) -> Void
+        onProgress: @escaping ([String: Any]) -> Void,
+        onBatchComplete: @escaping () -> Void
     ) {
-        let task = DownloadTask(
-            url: url,
-            filePath: filePath,
-            headers: headers,
-            maxConcurrentTasks: maxConcurrentTasks,
-            chunkSize: chunkSize,
-            retryCount: retryCount,
-            timeoutSeconds: timeoutSeconds
-        )
+        lock.lock()
+        batchActive = true
+        batchComplete = false
+        currentBatchUrls = urls
+        lock.unlock()
         
-        downloads[url] = task
+        let dispatchGroup = DispatchGroup()
+        let semaphore = DispatchSemaphore(value: maxConcurrentTasks)
         
-        downloadQueue.async {
-            self.downloadFile(task: task, onProgress: onProgress)
+        for url in urls {
+            dispatchGroup.enter()
+            
+            DispatchQueue.global(qos: .background).async {
+                semaphore.wait()
+                
+                self.downloadFile(
+                    url: url,
+                    filePath: filePath,
+                    headers: headers,
+                    retryCount: retryCount,
+                    timeoutSeconds: timeoutSeconds,
+                    onProgress: onProgress
+                ) { success in
+                    semaphore.signal()
+                    dispatchGroup.leave()
+                }
+            }
+        }
+        
+        dispatchGroup.notify(queue: .main) {
+            self.lock.lock()
+            self.batchActive = false
+            self.batchComplete = true
+            self.currentBatchUrls = []
+            self.lock.unlock()
+            
+            onBatchComplete()
         }
     }
     
-    private func downloadFile(task: DownloadTask, onProgress: @escaping ([String: Any]) -> Void) {
-        // Check if file exists for resume capability
-        let fileURL = URL(fileURLWithPath: task.filePath)
-        let fileManager = FileManager.default
-        
-        if fileManager.fileExists(atPath: task.filePath) {
-            do {
-                let attributes = try fileManager.attributesOfItem(atPath: task.filePath)
-                task.downloadedBytes = attributes[.size] as? Int64 ?? 0
-            } catch {
-                task.downloadedBytes = 0
-            }
-        }
-        
-        // Create directory if needed
-        let directory = fileURL.deletingLastPathComponent()
-        try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
-        
-        // Get file size
-        guard let url = URL(string: task.url) else {
-            task.status = .failed
-            task.error = "Invalid URL"
-            sendProgress(task: task, onProgress: onProgress)
+    private func downloadFile(
+        url: String,
+        filePath: String,
+        headers: [String: String],
+        retryCount: Int,
+        timeoutSeconds: Int,
+        onProgress: @escaping ([String: Any]) -> Void,
+        completion: @escaping (Bool) -> Void
+    ) {
+        guard let downloadURL = URL(string: url) else {
+            completion(false)
             return
         }
         
-        var headRequest = URLRequest(url: url)
-        headRequest.httpMethod = "HEAD"
-        for (key, value) in task.headers {
-            headRequest.setValue(value, forHTTPHeaderField: key)
+        var request = URLRequest(url: downloadURL)
+        request.timeoutInterval = TimeInterval(timeoutSeconds)
+        
+        for (key, value) in headers {
+            request.setValue(value, forHTTPHeaderField: key)
         }
         
-        let semaphore = DispatchSemaphore(value: 0)
-        var headError: Error?
-        
-        session.dataTask(with: headRequest) { _, response, error in
-            defer { semaphore.signal() }
-            
-            if let error = error {
-                headError = error
+        let task = urlSession?.downloadTask(with: request) { [weak self] tempURL, response, error in
+            guard let self = self else {
+                completion(false)
                 return
             }
             
-            if let httpResponse = response as? HTTPURLResponse {
-                task.totalBytes = httpResponse.expectedContentLength
-                task.acceptsRanges = httpResponse.allHeaderFields["Accept-Ranges"] as? String == "bytes"
+            if let error = error {
+                print("Download error for \(url): \(error)")
+                onProgress([
+                    "url": url,
+                    "status": "error",
+                    "error": error.localizedDescription,
+                    "progress": 0.0
+                ])
+                completion(false)
+                return
             }
-        }.resume()
-        
-        semaphore.wait()
-        
-        if let error = headError {
-            task.status = .failed
-            task.error = error.localizedDescription
-            sendProgress(task: task, onProgress: onProgress)
-            return
+            
+            guard let tempURL = tempURL else {
+                completion(false)
+                return
+            }
+            
+            do {
+                let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                let fileName = URL(string: url)?.lastPathComponent ?? "downloaded_file"
+                let destinationURL = documentsPath.appendingPathComponent(fileName)
+                
+                if FileManager.default.fileExists(atPath: destinationURL.path) {
+                    try FileManager.default.removeItem(at: destinationURL)
+                }
+                
+                try FileManager.default.moveItem(at: tempURL, to: destinationURL)
+                
+                onProgress([
+                    "url": url,
+                    "status": "completed",
+                    "progress": 1.0,
+                    "filePath": destinationURL.path
+                ])
+                
+                completion(true)
+            } catch {
+                print("File move error: \(error)")
+                onProgress([
+                    "url": url,
+                    "status": "error",
+                    "error": error.localizedDescription,
+                    "progress": 0.0
+                ])
+                completion(false)
+            }
         }
         
-        if task.totalBytes <= task.downloadedBytes {
-            task.status = .completed
-            task.downloadedBytes = task.totalBytes
-            sendProgress(task: task, onProgress: onProgress)
-            return
+        lock.lock()
+        downloadTasks[url] = task
+        downloadStatuses[url] = [
+            "url": url,
+            "status": "downloading",
+            "progress": 0.0
+        ]
+        lock.unlock()
+        
+        task?.resume()
+    }
+    
+    func pauseDownload(_ url: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        guard let task = downloadTasks[url] else { return false }
+        task.suspend()
+        downloadStatuses[url]?["status"] = "paused"
+        return true
+    }
+    
+    func resumeDownload(_ url: String, onProgress: @escaping ([String: Any]) -> Void) {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        guard let task = downloadTasks[url] else { return }
+        task.resume()
+        downloadStatuses[url]?["status"] = "downloading"
+    }
+    
+    func cancelDownload(_ url: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        guard let task = downloadTasks[url] else { return false }
+        task.cancel()
+        downloadTasks.removeValue(forKey: url)
+        downloadStatuses.removeValue(forKey: url)
+        return true
+    }
+    
+    func pauseAllDownloads() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        for task in downloadTasks.values {
+            task.suspend()
         }
         
-        task.status = .downloading
-        task.startTime = Date().timeIntervalSince1970
-        sendProgress(task: task, onProgress: onProgress)
+        for url in downloadStatuses.keys {
+            downloadStatuses[url]?["status"] = "paused"
+        }
         
-        if task.acceptsRanges && task.totalBytes > task.chunkSize && task.maxConcurrentTasks > 1 {
-            downloadMultiThreaded(task: task, onProgress: onProgress)
-        } else {
-            downloadSingleThreaded(task: task, onProgress: onProgress)
+        return true
+    }
+    
+    func resumeAllDownloads(onProgress: @escaping ([String: Any]) -> Void) {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        for task in downloadTasks.values {
+            task.resume()
+        }
+        
+        for url in downloadStatuses.keys {
+            downloadStatuses[url]?["status"] = "downloading"
         }
     }
-
-    private func downloadMultiThreaded(task: DownloadTask, onProgress: @escaping ([String: Any]) -> Void) {
-           let remainingBytes = task.totalBytes - task.downloadedBytes
-           let numThreads = min(task.maxConcurrentTasks, Int((remainingBytes / Int64(task.chunkSize)) + 1))
-           let chunkSize = remainingBytes / Int64(numThreads)
-
-           let group = DispatchGroup()
-           let fileHandle: FileHandle
-
-           do {
-               if !FileManager.default.fileExists(atPath: task.filePath) {
-                   FileManager.default.createFile(atPath: task.filePath, contents: nil)
-               }
-               fileHandle = try FileHandle(forWritingTo: URL(fileURLWithPath: task.filePath))
-           } catch {
-               task.status = .failed
-               task.error = "Could not open file for writing"
-               sendProgress(task: task, onProgress: onProgress)
-               return
-           }
-
-           for i in 0..<numThreads {
-               let startByte = task.downloadedBytes + Int64(i) * chunkSize
-               let endByte = i == numThreads - 1 ? task.totalBytes - 1 : task.downloadedBytes + Int64(i + 1) * chunkSize - 1
-
-               group.enter()
-               downloadQueue.async {
-                   self.downloadChunk(
-                       task: task,
-                       startByte: startByte,
-                       endByte: endByte,
-                       fileHandle: fileHandle,
-                       onProgress: onProgress
-                   ) {
-                       group.leave()
-                   }
-               }
-           }
-
-           group.notify(queue: downloadQueue) {
-               fileHandle.closeFile()
-               if task.status == .downloading {
-                   task.status = .completed
-                   self.sendProgress(task: task, onProgress: onProgress)
-               }
-           }
-       }
-
-       private func downloadChunk(
-           task: DownloadTask,
-           startByte: Int64,
-           endByte: Int64,
-           fileHandle: FileHandle,
-           onProgress: @escaping ([String: Any]) -> Void,
-           completion: @escaping () -> Void
-       ) {
-           var retries = 0
-
-           func attemptDownload() {
-               guard let url = URL(string: task.url) else {
-                   task.status = .failed
-                   task.error = "Invalid URL"
-                   completion()
-                   return
-               }
-
-               var request = URLRequest(url: url)
-               request.setValue("bytes=\(startByte)-\(endByte)", forHTTPHeaderField: "Range")
-               for (key, value) in task.headers {
-                   request.setValue(value, forHTTPHeaderField: key)
-               }
-
-               session.dataTask(with: request) { data, response, error in
-                   if let error = error {
-                       retries += 1
-                       if retries <= task.retryCount && task.status == .downloading {
-                           DispatchQueue.global().asyncAfter(deadline: .now() + Double(retries)) {
-                               attemptDownload()
-                           }
-                       } else {
-                           task.status = .failed
-                           task.error = "Chunk download failed: \(error.localizedDescription)"
-                           completion()
-                       }
-                       return
-                   }
-
-                   guard let httpResponse = response as? HTTPURLResponse,
-                         httpResponse.statusCode == 206 || httpResponse.statusCode == 200,
-                         let data = data else {
-                       retries += 1
-                       if retries <= task.retryCount && task.status == .downloading {
-                           DispatchQueue.global().asyncAfter(deadline: .now() + Double(retries)) {
-                               attemptDownload()
-                           }
-                       } else {
-                           task.status = .failed
-                           task.error = "HTTP error: \((response as? HTTPURLResponse)?.statusCode ?? 0)"
-                           completion()
-                       }
-                       return
-                   }
-
-                   // Write data to file
-                   fileHandle.seek(toFileOffset: UInt64(startByte))
-                   fileHandle.write(data)
-
-                   // Update progress
-                   task.downloadedBytes += Int64(data.count)
-                   self.sendProgress(task: task, onProgress: onProgress)
-
-                   completion()
-               }.resume()
-           }
-
-           attemptDownload()
-       }
-
-       private func downloadSingleThreaded(task: DownloadTask, onProgress: @escaping ([String: Any]) -> Void) {
-           var retries = 0
-
-           func attemptDownload() {
-               guard let url = URL(string: task.url) else {
-                   task.status = .failed
-                   task.error = "Invalid URL"
-                   sendProgress(task: task, onProgress: onProgress)
-                   return
-               }
-
-               var request = URLRequest(url: url)
-               if task.downloadedBytes > 0 {
-                   request.setValue("bytes=\(task.downloadedBytes)-", forHTTPHeaderField: "Range")
-               }
-               for (key, value) in task.headers {
-                   request.setValue(value, forHTTPHeaderField: key)
-               }
-
-               let downloadTask = session.downloadTask(with: request) { tempURL, response, error in
-                   if let error = error {
-                       retries += 1
-                       if retries <= task.retryCount && task.status == .downloading {
-                           DispatchQueue.global().asyncAfter(deadline: .now() + Double(retries)) {
-                               attemptDownload()
-                           }
-                       } else {
-                           task.status = .failed
-                           task.error = "Download failed: \(error.localizedDescription)"
-                           self.sendProgress(task: task, onProgress: onProgress)
-                       }
-                       return
-                   }
-
-                   guard let httpResponse = response as? HTTPURLResponse,
-                         httpResponse.statusCode == 200 || httpResponse.statusCode == 206,
-                         let tempURL = tempURL else {
-                       retries += 1
-                       if retries <= task.retryCount && task.status == .downloading {
-                           DispatchQueue.global().asyncAfter(deadline: .now() + Double(retries)) {
-                               attemptDownload()
-                           }
-                       } else {
-                           task.status = .failed
-                           task.error = "HTTP error: \((response as? HTTPURLResponse)?.statusCode ?? 0)"
-                           self.sendProgress(task: task, onProgress: onProgress)
-                       }
-                       return
-                   }
-
-                   do {
-                       let destinationURL = URL(fileURLWithPath: task.filePath)
-
-                       if task.downloadedBytes > 0 {
-                           // Append to existing file
-                           let tempData = try Data(contentsOf: tempURL)
-                           let fileHandle = try FileHandle(forWritingTo: destinationURL)
-                           fileHandle.seekToEndOfFile()
-                           fileHandle.write(tempData)
-                           fileHandle.closeFile()
-                       } else {
-                           // Move temp file to destination
-                           if FileManager.default.fileExists(atPath: task.filePath) {
-                               try FileManager.default.removeItem(at: destinationURL)
-                           }
-                           try FileManager.default.moveItem(at: tempURL, to: destinationURL)
-                       }
-
-                       if task.status == .downloading {
-                           task.status = .completed
-                           task.downloadedBytes = task.totalBytes
-                           self.sendProgress(task: task, onProgress: onProgress)
-                       }
-                   } catch {
-                       task.status = .failed
-                       task.error = "File operation failed: \(error.localizedDescription)"
-                       self.sendProgress(task: task, onProgress: onProgress)
-                   }
-               }
-
-               // Track progress for single-threaded downloads
-               task.urlSessionTask = downloadTask
-               downloadTask.resume()
-           }
-
-           attemptDownload()
-       }
-
-       private func sendProgress(task: DownloadTask, onProgress: @escaping ([String: Any]) -> Void) {
-           let currentTime = Date().timeIntervalSince1970
-           let timeElapsed = max(1, currentTime - task.startTime)
-           let speed = timeElapsed > 0 ? Double(task.downloadedBytes) / timeElapsed : 0.0
-           let progress = task.totalBytes > 0 ? Int((Double(task.downloadedBytes) * 100.0) / Double(task.totalBytes)) : 0
-
-           let progressMap: [String: Any] = [
-               "url": task.url,
-               "filePath": task.filePath,
-               "progress": progress,
-               "bytesDownloaded": task.downloadedBytes,
-               "totalBytes": task.totalBytes,
-               "status": task.status.rawValue,
-               "error": task.error as Any,
-               "speed": speed
-           ]
-
-           onProgress(progressMap)
-       }
-
-       func pauseDownload(url: String) -> Bool {
-           guard let task = downloads[url] else { return false }
-           if task.status == .downloading {
-               task.status = .paused
-               task.urlSessionTask?.cancel()
-               return true
-           }
-           return false
-       }
-
-       func resumeDownload(url: String, onProgress: @escaping ([String: Any]) -> Void) {
-           guard let task = downloads[url] else { return }
-           if task.status == .paused {
-               downloadQueue.async {
-                   self.downloadFile(task: task, onProgress: onProgress)
-               }
-           }
-       }
-
-       func cancelDownload(url: String) -> Bool {
-           guard let task = downloads[url] else { return false }
-           task.status = .cancelled
-           task.urlSessionTask?.cancel()
-
-           // Delete partial file
-           try? FileManager.default.removeItem(atPath: task.filePath)
-
-           downloads.removeValue(forKey: url)
-           return true
-       }
-
-       func getDownloadStatus(url: String) -> [String: Any]? {
-           guard let task = downloads[url] else { return nil }
-
-           let currentTime = Date().timeIntervalSince1970
-           let timeElapsed = max(1, currentTime - task.startTime)
-           let speed = timeElapsed > 0 ? Double(task.downloadedBytes) / timeElapsed : 0.0
-           let progress = task.totalBytes > 0 ? Int((Double(task.downloadedBytes) * 100.0) / Double(task.totalBytes)) : 0
-
-           return [
-               "url": task.url,
-               "filePath": task.filePath,
-               "progress": progress,
-               "bytesDownloaded": task.downloadedBytes,
-               "totalBytes": task.totalBytes,
-               "status": task.status.rawValue,
-               "error": task.error as Any,
-               "speed": speed
-           ]
-       }
-
-       func getAllDownloads() -> [[String: Any]] {
-           return downloads.values.compactMap { task in
-               getDownloadStatus(url: task.url)
-           }
-       }
-
-       func clearCompletedDownloads() -> Bool {
-           let completedUrls = downloads.filter { $0.value.status == .completed }.map { $0.key }
-           completedUrls.forEach { url in
-               downloads.removeValue(forKey: url)
-           }
-           return true
-       }
+    
+    func cancelAllDownloads() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        for task in downloadTasks.values {
+            task.cancel()
+        }
+        
+        downloadTasks.removeAll()
+        downloadStatuses.removeAll()
+        batchActive = false
+        batchComplete = false
+        currentBatchUrls = []
+        
+        return true
     }
-
-    // MARK: - Data Models
-    class DownloadTask {
-       let url: String
-       let filePath: String
-       let headers: [String: String]
-       let maxConcurrentTasks: Int
-       let chunkSize: Int
-       let retryCount: Int
-       let timeoutSeconds: Int
-
-       var totalBytes: Int64 = 0
-       var downloadedBytes: Int64 = 0
-       var status: DownloadStatus = .pending
-       var error: String?
-       var startTime: TimeInterval = 0
-       var acceptsRanges: Bool = false
-       var urlSessionTask: URLSessionTask?
-
-       init(url: String, filePath: String, headers: [String: String], maxConcurrentTasks: Int, chunkSize: Int, retryCount: Int, timeoutSeconds: Int) {
-           self.url = url
-           self.filePath = filePath
-           self.headers = headers
-           self.maxConcurrentTasks = maxConcurrentTasks
-           self.chunkSize = chunkSize
-           self.retryCount = retryCount
-           self.timeoutSeconds = timeoutSeconds
-       }
+    
+    func pauseDownloads(_ urls: [String]) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        for url in urls {
+            if let task = downloadTasks[url] {
+                task.suspend()
+                downloadStatuses[url]?["status"] = "paused"
+            }
+        }
+        return true
     }
-
-    enum DownloadStatus: Int {
-       case pending = 0
-       case downloading = 1
-       case paused = 2
-       case completed = 3
-       case failed = 4
-       case cancelled = 5
+    
+    func resumeDownloads(_ urls: [String], onProgress: @escaping ([String: Any]) -> Void) {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        for url in urls {
+            if let task = downloadTasks[url] {
+                task.resume()
+                downloadStatuses[url]?["status"] = "downloading"
+            }
+        }
     }
-
+    
+    func cancelDownloads(_ urls: [String]) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        for url in urls {
+            if let task = downloadTasks[url] {
+                task.cancel()
+                downloadTasks.removeValue(forKey: url)
+                downloadStatuses.removeValue(forKey: url)
+            }
+        }
+        return true
+    }
+    
+    func getDownloadStatus(_ url: String) -> [String: Any]? {
+        lock.lock()
+        defer { lock.unlock() }
+        return downloadStatuses[url]
+    }
+    
+    func getDownloadStatuses(_ urls: [String]) -> [[String: Any]] {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        return urls.compactMap { downloadStatuses[$0] }
+    }
+    
+    func getAllDownloads() -> [[String: Any]] {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        return Array(downloadStatuses.values)
+    }
+    
+    func getBatchProgress() -> [String: Any] {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        let totalTasks = downloadStatuses.count
+        let completedTasks = downloadStatuses.values.filter { 
+            ($0["status"] as? String) == "completed" 
+        }.count
+        
+        return [
+            "totalTasks": totalTasks,
+            "completedTasks": completedTasks,
+            "progress": totalTasks > 0 ? Double(completedTasks) / Double(totalTasks) : 0.0
+        ]
+    }
+    
+    func clearCompletedDownloads() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        let completedUrls = downloadStatuses.compactMap { (key, value) in
+            (value["status"] as? String) == "completed" ? key : nil
+        }
+        
+        for url in completedUrls {
+            downloadStatuses.removeValue(forKey: url)
+            downloadTasks.removeValue(forKey: url)
+        }
+        
+        return true
+    }
+    
+    func isBatchActive() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return batchActive
+    }
+    
+    func isBatchComplete() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return batchComplete
+    }
+    
+    func isReadyForNewBatch() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !batchActive
+    }
+}
