@@ -566,13 +566,25 @@ class HighPerformanceHlsDownloader {
 
     // Helper functions
 
-    private fun calculateSegmentPriority(index: Int, totalSegments: Int, variantIndex: Int): Int {
-        return when {
-            index < 5 -> 100 - index // Highest priority for first segments
-            index < totalSegments * 0.1 -> 80 - index // High priority for early segments
-            index < totalSegments * 0.3 -> 60 // Medium priority
-            else -> 40 // Normal priority
-        } - (variantIndex * 10) // Prefer higher quality variants
+    private func calculateSegmentPriority(index: Int, totalSegments: Int, variantIndex: Int) -> Int {
+        let basePriority: Int
+
+                // Calculate bounds and ensure they're valid
+                let earlyBound = max(5, Int(Double(totalSegments) * 0.1))
+        let mediumBound = max(earlyBound, Int(Double(totalSegments) * 0.3))
+
+        switch index {
+            case 0..<5:
+            basePriority = 100 - index // Highest priority for first segments
+            case 5..<earlyBound:
+            basePriority = 80 - index // High priority for early segments
+            case earlyBound..<mediumBound:
+            basePriority = 60 // Medium priority
+            default:
+            basePriority = 40 // Normal priority
+        }
+
+        return basePriority - (variantIndex * 10) // Prefer higher quality variants
     }
 
     private suspend fun getContentLength(url: String, headers: Map<String, String>): Long? {

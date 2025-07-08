@@ -27,20 +27,3 @@ enum MTDownloadStatus: Int {
     case cancelled = 5
     case initializing = 6
 }
-
-//struct SegmentTask {
-//    let url: String
-//    let fileName: String
-//    let size: Int64 = 0
-//    var downloaded: Bool = false
-//    var bytes: Int64 = 0
-//    let duration: Double = 10.0
-//}
-//
-//struct VariantPlaylist {
-//    let url: String
-//    let fileName: String
-//    let bandwidth: Int64 = 0
-//    // let segments: [SegmentTask] = []
-//    let resolution: String = ""
-//}
