@@ -3,13 +3,13 @@ import Combine
 
 // MARK: - Data Models
 
-enum DownloadStatus: String {
-    case pending = "pending"
-    case downloading = "downloading"
-    case completed = "completed"
-    case failed = "failed"
-    case paused = "paused"
-}
+//enum DownloadStatus: String {
+//    case pending = "pending"
+//    case downloading = "downloading"
+//    case completed = "completed"
+//    case failed = "failed"
+//    case paused = "paused"
+//}
 
 //struct MTDownloadTask {
 //    let url: String

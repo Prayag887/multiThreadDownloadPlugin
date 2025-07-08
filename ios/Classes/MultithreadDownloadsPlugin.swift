@@ -79,11 +79,11 @@ public class MultithreadDownloadsPlugin: NSObject, FlutterPlugin, FlutterStreamH
         case "pauseAllDownloads":
             result(downloadManager.pauseAllDownloads())
 
-        case "resumeAllDownloads":
-            downloadManager.resumeAllDownloads { [weak self] progress in
-                self?.sendProgress(progress: progress)
-            }
-            result(true)
+//        case "resumeAllDownloads":
+//            downloadManager.resumeAllDownloads { [weak self] progress in
+//                self?.sendProgress(progress: progress)
+//            }
+//            result(true)
 
         case "cancelAllDownloads":
             let cancelled = downloadManager.cancelAllDownloads()
@@ -94,32 +94,32 @@ public class MultithreadDownloadsPlugin: NSObject, FlutterPlugin, FlutterStreamH
             sendQueueStatus()
             result(cancelled)
 
-        case "pauseDownloads":
-            guard let args = call.arguments as? [String: Any],
-                  let urls = args["urls"] as? [String] else {
-                result(false)
-                return
-            }
-            result(downloadManager.pauseDownloads(urls: urls))
+//        case "pauseDownloads":
+//            guard let args = call.arguments as? [String: Any],
+//                  let urls = args["urls"] as? [String] else {
+//                result(false)
+//                return
+//            }
+//            result(downloadManager.pauseDownloads(urls: urls))
+//
+//        case "resumeDownloads":
+//            guard let args = call.arguments as? [String: Any],
+//                  let urls = args["urls"] as? [String] else {
+//                result(false)
+//                return
+//            }
+//            downloadManager.resumeDownloads(urls: urls) { [weak self] progress in
+//                self?.sendProgress(progress: progress)
+//            }
+//            result(true)
 
-        case "resumeDownloads":
-            guard let args = call.arguments as? [String: Any],
-                  let urls = args["urls"] as? [String] else {
-                result(false)
-                return
-            }
-            downloadManager.resumeDownloads(urls: urls) { [weak self] progress in
-                self?.sendProgress(progress: progress)
-            }
-            result(true)
-
-        case "cancelDownloads":
-            guard let args = call.arguments as? [String: Any],
-                  let urls = args["urls"] as? [String] else {
-                result(false)
-                return
-            }
-            result(downloadManager.cancelDownloads(urls: urls))
+//        case "cancelDownloads":
+//            guard let args = call.arguments as? [String: Any],
+//                  let urls = args["urls"] as? [String] else {
+//                result(false)
+//                return
+//            }
+//            result(downloadManager.cancelDownloads(urls: urls))
 
         case "getDownloadStatus":
             guard let args = call.arguments as? [String: Any],
@@ -129,16 +129,16 @@ public class MultithreadDownloadsPlugin: NSObject, FlutterPlugin, FlutterStreamH
             }
             result(downloadManager.getDownloadStatus(url: url))
 
-        case "getDownloadStatuses":
-            guard let args = call.arguments as? [String: Any],
-                  let urls = args["urls"] as? [String] else {
-                result([])
-                return
-            }
-            result(downloadManager.getDownloadStatuses(urls: urls))
+//        case "getDownloadStatuses":
+//            guard let args = call.arguments as? [String: Any],
+//                  let urls = args["urls"] as? [String] else {
+//                result([])
+//                return
+//            }
+//            result(downloadManager.getDownloadStatuses(urls: urls))
 
-        case "getAllDownloads":
-            result(downloadManager.getAllDownloads())
+//        case "getAllDownloads":
+//            result(downloadManager.getAllDownloads())
 
         case "getBatchProgress":
             result(downloadManager.getBatchProgress())

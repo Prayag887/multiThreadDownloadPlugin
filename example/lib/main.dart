@@ -340,8 +340,9 @@ class _MyAppState extends State<MyApp> {
                           const SizedBox(height: 8),
                           ElevatedButton(
                             onPressed: () {
-                              if (isHls) {
+                              if (true) {
                                 final playlistPath = _findPlaylistFile(download.filePath);
+                                print("THIS IS PLAYLIST PATH:$playlistPath");
                                 if (playlistPath != null) {
                                   _playLocalFile(playlistPath);
                                 } else {

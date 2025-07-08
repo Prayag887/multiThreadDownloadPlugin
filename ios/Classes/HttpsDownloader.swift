@@ -1,7 +1,7 @@
 import Foundation
 
 @available(iOS 13.0, *)
-class HttpsDownloader {
+class MTHttpsDownloader {
 
     func downloadSingleFile(
         task: MTDownloadTask,
@@ -22,7 +22,7 @@ class HttpsDownloader {
 
         task.status = .downloading
         task.startTime = Date().timeIntervalSince1970 * 1000
-        task.lastSpeedUpdate = task.startTime
+//        task.lastSpeedUpdate = task.startTime
 
         let totalBytes = await getFileSize(task: task)
         task.totalBytes = totalBytes

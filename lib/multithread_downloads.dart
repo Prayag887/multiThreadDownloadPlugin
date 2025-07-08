@@ -237,7 +237,7 @@ class DownloadProgress {
     print('Full map: $map');
 
     // Check each field that could cause the error
-    ['progress', 'bytesDownloaded', 'totalBytes', 'status'].forEach((key) {
+    ['progress', 'bytesDownloaded', 'totalBytes', 'status', 'filePath'].forEach((key) {
       final value = map[key];
       print('$key: "$value" (type: ${value.runtimeType})');
     });

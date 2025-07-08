@@ -1,5 +1,180 @@
 import Foundation
 
+
+// MARK: - Download Task Model
+@available(iOS 13.0, *)
+class MTDownloadTask {
+    let url: String
+    var filePath: String
+    let fileName: String
+    let headers: [String: String]
+    var status: MTDownloadStatus = .initializing
+    var downloadedBytes: Int64 = 0
+    var totalBytes: Int64 = 0
+    var startTime: Double = Date().timeIntervalSince1970 * 1000
+    var speedHistory: [Double] = []
+    var error: String?
+    var job: Task<Void, Error>?
+    var retryCount: Int = 3
+    var timeoutSeconds: Int = 30
+
+    init(url: String, filePath: String, fileName: String, headers: [String: String] = [:]) {
+        self.url = url
+        self.filePath = filePath
+        self.fileName = fileName
+        self.headers = headers
+    }
+}
+
+// MARK: - HTTPS Downloader
+@available(iOS 15.0, *)
+class HttpsDownloader {
+
+    func downloadSingleFile(task: MTDownloadTask, onProgress: @escaping ([String: Any]) -> Void) async throws {
+        guard let url = URL(string: task.url) else {
+            throw URLError(.badURL)
+        }
+
+        // Create the full file path
+        let fileURL = URL(fileURLWithPath: task.filePath).appendingPathComponent(task.fileName)
+
+        // Check if file partially exists for resume
+        var startByte: Int64 = 0
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+            startByte = attributes[.size] as? Int64 ?? 0
+            task.downloadedBytes = startByte
+        }
+
+        // Configure URL request
+        var request = URLRequest(url: url)
+        request.timeoutInterval = TimeInterval(task.timeoutSeconds)
+
+        // Add headers
+        for (key, value) in task.headers {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+
+        // Add range header for resume
+        if startByte > 0 {
+            request.setValue("bytes=\(startByte)-", forHTTPHeaderField: "Range")
+        }
+
+        task.status = .downloading
+        let startTime = Date().timeIntervalSince1970 * 1000
+
+        do {
+            let (asyncBytes, response) = try await URLSession.shared.bytes(for: request)
+
+            // Get content length
+            if let httpResponse = response as? HTTPURLResponse {
+                let contentLength = httpResponse.expectedContentLength
+                if contentLength > 0 {
+                    task.totalBytes = startByte + contentLength
+                } else if let contentLengthHeader = httpResponse.value(forHTTPHeaderField: "Content-Length"),
+                          let length = Int64(contentLengthHeader) {
+                    task.totalBytes = startByte + length
+                }
+            }
+
+            // Create or open file for writing
+            let fileHandle: FileHandle
+            if startByte > 0 {
+                fileHandle = try FileHandle(forWritingTo: fileURL)
+                try fileHandle.seek(toOffset: UInt64(startByte))
+            } else {
+                FileManager.default.createFile(atPath: fileURL.path, contents: nil, attributes: nil)
+                fileHandle = try FileHandle(forWritingTo: fileURL)
+            }
+
+            defer {
+                try? fileHandle.close()
+            }
+
+            var lastProgressTime = startTime
+            let progressInterval: Double = 500 // Update every 500ms
+
+            // Download data
+            var buffer = Data()
+            for try await byte in asyncBytes {
+                try Task.checkCancellation()
+
+                buffer.append(byte)
+                task.downloadedBytes += 1
+
+                // Write buffer when it reaches a certain size (e.g., 8KB)
+                if buffer.count >= 8192 {
+                    try fileHandle.write(contentsOf: buffer)
+                    buffer.removeAll()
+                }
+
+                // Update progress periodically
+                let currentTime = Date().timeIntervalSince1970 * 1000
+                if currentTime - lastProgressTime >= progressInterval {
+                    updateSpeedHistory(task: task, currentTime: currentTime)
+                    sendProgress(task: task, onProgress: onProgress)
+                    lastProgressTime = currentTime
+                }
+            }
+
+            // Write any remaining data in buffer
+            if !buffer.isEmpty {
+                try fileHandle.write(contentsOf: buffer)
+            }
+
+            task.status = .completed
+            sendProgress(task: task, onProgress: onProgress)
+
+        } catch {
+            if error is CancellationError {
+                task.status = .cancelled
+            } else {
+                task.status = .failed
+                task.error = error.localizedDescription
+            }
+            sendProgress(task: task, onProgress: onProgress)
+            throw error
+        }
+    }
+
+    private func updateSpeedHistory(task: MTDownloadTask, currentTime: Double) {
+        let timeElapsed = max(1.0, currentTime - task.startTime)
+        let currentSpeed = Double(task.downloadedBytes) * 1000.0 / timeElapsed
+
+        task.speedHistory.append(currentSpeed)
+
+        // Keep only last 10 speed measurements
+        if task.speedHistory.count > 10 {
+            task.speedHistory.removeFirst()
+        }
+    }
+
+    private func sendProgress(task: MTDownloadTask, onProgress: ([String: Any]) -> Void) {
+        let currentTime = Date().timeIntervalSince1970 * 1000
+        let timeElapsed = max(1.0, currentTime - task.startTime)
+
+        let avgSpeed: Double
+        if !task.speedHistory.isEmpty {
+            avgSpeed = task.speedHistory.reduce(0, +) / Double(task.speedHistory.count)
+        } else {
+            avgSpeed = Double(task.downloadedBytes) * 1000.0 / timeElapsed
+        }
+
+        let progress = task.totalBytes > 0 ? Int(Double(task.downloadedBytes) * 100.0 / Double(task.totalBytes)) : -1
+
+        onProgress([
+            "url": task.url,
+            "filePath": task.filePath,
+            "progress": progress,
+            "bytesDownloaded": task.downloadedBytes,
+            "totalBytes": task.totalBytes,
+            "status": task.status.rawValue,
+            "error": task.error ?? "",
+            "speed": avgSpeed
+        ])
+    }
+}
+// MARK: - Parallel Download Manager
 @available(iOS 15.0, *)
 class ParallelDownloadManager {
     
@@ -13,7 +188,6 @@ class ParallelDownloadManager {
     private let httpsDownloader = HttpsDownloader()
     private let hlsDownloader = HighPerformanceHlsDownloader()
     
-    @available(iOS 15.0, *)
     func startBatchDownload(
         urls: [String],
         basePath: String,
@@ -37,9 +211,26 @@ class ParallelDownloadManager {
         
         urls.forEach { url in
             let fileName = extractFileName(url: url)
-            let fullPath = URL(fileURLWithPath: basePath).appendingPathComponent(fileName).path
-            var task = MTDownloadTask(url: url, filePath: fullPath, fileName: fileName, headers: headers)
-            task.filePath = fullPath
+            
+            // Clean and turn it into a folder name
+            let folderName = fileName
+                .replacingOccurrences(of: ".m3u8", with: "")
+                .replacingOccurrences(of: "/", with: "_")
+            
+            let safeFolderName = folderName.isEmpty ? "download" : folderName
+            let downloadDir = URL(fileURLWithPath: basePath).appendingPathComponent(safeFolderName).path
+            
+            // Ensure the directory exists
+            try? FileManager.default.createDirectory(atPath: downloadDir, withIntermediateDirectories: true, attributes: nil)
+            
+            // Set up the task
+            var task = MTDownloadTask(
+                url: url,
+                filePath: downloadDir,
+                fileName: fileName,
+                headers: headers
+            )
+            
             task.retryCount = retryCount
             task.timeoutSeconds = timeoutSeconds
             
@@ -69,16 +260,16 @@ class ParallelDownloadManager {
                             return
                         }
                         self?.downloadsLock.unlock()
-
+                        
                         do {
                             var task = originalTask
-
+                            
                             if task.url.lowercased().hasSuffix(".m3u8") {
                                 try await self?.hlsDownloader.downloadHlsStreamAdvanced(task: task, basePath: basePath, onProgress: onProgress)
                             } else {
                                 try await self?.httpsDownloader.downloadSingleFile(task: task, onProgress: onProgress)
                             }
-
+                            
                             // Optional: Save updated task state back if needed
                             self?.downloads[url] = task
                         } catch {
@@ -107,7 +298,7 @@ class ParallelDownloadManager {
         }
     }
     
-    // Check if batch is complete
+    // MARK: - Status Methods
     func isBatchComplete() -> Bool {
         downloadsLock.lock()
         defer { downloadsLock.unlock() }
@@ -123,7 +314,6 @@ class ParallelDownloadManager {
         return completedTasks >= totalTasks
     }
     
-    // This function is now being used properly
     func isReadyForNewBatch() -> Bool {
         let jobNotActive = batchTask?.isCancelled != false
         
@@ -137,7 +327,6 @@ class ParallelDownloadManager {
         return jobNotActive && (downloadsEmpty || (isBatchComplete() && noActiveDownloads))
     }
     
-    // Check if batch is actively downloading
     func isBatchActive() -> Bool {
         let jobActive = batchTask?.isCancelled == false
         
@@ -150,59 +339,7 @@ class ParallelDownloadManager {
         return jobActive && hasActiveDownloads
     }
     
-    private func extractFileName(url: String) -> String {
-        do {
-            if let uri = URL(string: url) {
-                let path = uri.path
-                let fileName = URL(fileURLWithPath: path).lastPathComponent
-                
-                if !fileName.isEmpty && fileName.contains(".") {
-                    return fileName
-                } else {
-                    return "download_\(Int64(Date().timeIntervalSince1970 * 1000)).tmp"
-                }
-            } else {
-                return "download_\(Int64(Date().timeIntervalSince1970 * 1000)).tmp"
-            }
-        } catch {
-            return "download_\(Int64(Date().timeIntervalSince1970 * 1000)).tmp"
-        }
-    }
-    
-    private func sendProgress(task: MTDownloadTask, onProgress: ([String: Any]) -> Void) {
-        let currentTime = Date().timeIntervalSince1970 * 1000
-        let timeElapsed = max(1.0, currentTime - task.startTime)
-        
-        let avgSpeed: Double
-        if !task.speedHistory.isEmpty {
-            avgSpeed = task.speedHistory.reduce(0, +) / Double(task.speedHistory.count)
-        } else {
-            avgSpeed = Double(task.downloadedBytes) * 1000.0 / timeElapsed
-        }
-        
-        let progress = task.totalBytes > 0 ? Int(Double(task.downloadedBytes) * 100.0 / Double(task.totalBytes)) : -1
-        
-        onProgress([
-            "url": task.url,
-            "filePath": task.filePath,
-            "progress": progress,
-            "bytesDownloaded": task.downloadedBytes,
-            "totalBytes": task.totalBytes,
-            "status": task.status.rawValue,
-            "error": task.error ?? "",
-            "speed": avgSpeed
-        ])
-    }
-    
-    private func sendBatchProgress(onProgress: ([String: Any]) -> Void) {
-        if let batchProgress = getBatchProgress() {
-            var progress = batchProgress
-            progress["isBatchProgress"] = true
-            onProgress(progress)
-        }
-    }
-    
-    // Rest of the methods remain the same...
+    // MARK: - Control Methods
     func pauseDownload(url: String) -> Bool {
         downloadsLock.lock()
         defer { downloadsLock.unlock() }
@@ -224,14 +361,14 @@ class ParallelDownloadManager {
             return
         }
         downloadsLock.unlock()
-
+        
         if originalTask.status == .paused {
             downloadsLock.lock()
             downloads[url]?.speedHistory.removeAll()
-
+            
             downloads[url]?.job = Task { [weak self] in
                 var task = originalTask
-
+                
                 do {
                     if task.url.lowercased().hasSuffix(".m3u8") {
                         let basePath = URL(fileURLWithPath: task.filePath).deletingLastPathComponent().path
@@ -246,16 +383,16 @@ class ParallelDownloadManager {
                             onProgress: onProgress
                         )
                     }
-
+                    
                     self?.downloadsLock.lock()
                     self?.downloads[url] = task
                     self?.downloadsLock.unlock()
-
+                    
                 } catch {
                     self?.downloadsLock.lock()
                     self?.downloads[url]?.status = .failed
                     self?.downloads[url]?.error = error.localizedDescription
-
+                    
                     if let updatedTask = self?.downloads[url] {
                         self?.downloadsLock.unlock()
                         self?.sendProgress(task: updatedTask, onProgress: onProgress)
@@ -264,11 +401,11 @@ class ParallelDownloadManager {
                     }
                 }
             }
-
+            
             downloadsLock.unlock()
         }
     }
-
+    
     func cancelDownload(url: String) -> Bool {
         downloadsLock.lock()
         defer { downloadsLock.unlock() }
@@ -298,64 +435,6 @@ class ParallelDownloadManager {
         return hasActive
     }
     
-    func resumeAllDownloads(onProgress: @escaping ([String: Any]) -> Void) {
-        downloadsLock.lock()
-        let pausedUrls = downloads.compactMap { (url, task) in
-            task.status == .paused ? url : nil
-        }
-        downloadsLock.unlock()
-        
-        if !pausedUrls.isEmpty {
-            for url in pausedUrls {
-                downloadsLock.lock()
-                guard let originalTask = downloads[url] else {
-                    downloadsLock.unlock()
-                    continue
-                }
-
-                downloads[url]?.speedHistory.removeAll()
-                downloads[url]?.job = Task { [weak self] in
-                    var task = originalTask
-
-                    do {
-                        if task.url.lowercased().hasSuffix(".m3u8") {
-                            let basePath = URL(fileURLWithPath: task.filePath).deletingLastPathComponent().path
-                            try await self?.hlsDownloader.downloadHlsStreamAdvanced(
-                                task: task,
-                                basePath: basePath,
-                                onProgress: onProgress
-                            )
-                        } else {
-                            try await self?.httpsDownloader.downloadSingleFile(
-                                task: task,
-                                onProgress: onProgress
-                            )
-                        }
-
-                        self?.downloadsLock.lock()
-                        self?.downloads[url] = task
-                        self?.downloadsLock.unlock()
-
-                    } catch {
-                        self?.downloadsLock.lock()
-                        self?.downloads[url]?.status = .failed
-                        self?.downloads[url]?.error = error.localizedDescription
-
-                        if let updatedTask = self?.downloads[url] {
-                            self?.downloadsLock.unlock()
-                            self?.sendProgress(task: updatedTask, onProgress: onProgress)
-                        } else {
-                            self?.downloadsLock.unlock()
-                        }
-                    }
-                }
-
-                downloadsLock.unlock()
-            }
-        }
-
-    }
-    
     func cancelAllDownloads() -> Bool {
         batchTask?.cancel()
         onBatchComplete = nil
@@ -371,91 +450,7 @@ class ParallelDownloadManager {
         return true
     }
     
-    func pauseDownloads(urls: [String]) -> Bool {
-        downloadsLock.lock()
-        defer { downloadsLock.unlock() }
-        
-        var hasActive = false
-        for url in urls {
-            if let task = downloads[url] {
-                if task.status == .downloading {
-                    downloads[url]?.status = .paused
-                    downloads[url]?.job?.cancel()
-                    hasActive = true
-                }
-            }
-        }
-        return hasActive
-    }
-    
-    func resumeDownloads(urls: [String], onProgress: @escaping ([String: Any]) -> Void) {
-        for url in urls {
-            downloadsLock.lock()
-            guard let originalTask = downloads[url] else {
-                downloadsLock.unlock()
-                continue
-            }
-
-            if originalTask.status == .paused {
-                downloads[url]?.speedHistory.removeAll()
-
-                downloads[url]?.job = Task { [weak self] in
-                    var task = originalTask
-
-                    do {
-                        if task.url.lowercased().hasSuffix(".m3u8") {
-                            let basePath = URL(fileURLWithPath: task.filePath).deletingLastPathComponent().path
-                            try await self?.hlsDownloader.downloadHlsStreamAdvanced(
-                                task: task,
-                                basePath: basePath,
-                                onProgress: onProgress
-                            )
-                        } else {
-                            try await self?.httpsDownloader.downloadSingleFile(
-                                task: task,
-                                onProgress: onProgress
-                            )
-                        }
-
-                        self?.downloadsLock.lock()
-                        self?.downloads[url] = task
-                        self?.downloadsLock.unlock()
-
-                    } catch {
-                        self?.downloadsLock.lock()
-                        self?.downloads[url]?.status = .failed
-                        self?.downloads[url]?.error = error.localizedDescription
-
-                        if let updatedTask = self?.downloads[url] {
-                            self?.downloadsLock.unlock()
-                            self?.sendProgress(task: updatedTask, onProgress: onProgress)
-                        } else {
-                            self?.downloadsLock.unlock()
-                        }
-                    }
-                }
-            }
-            downloadsLock.unlock()
-        }
-    }
-    
-    func cancelDownloads(urls: [String]) -> Bool {
-        downloadsLock.lock()
-        defer { downloadsLock.unlock() }
-        
-        var hasActive = false
-        for url in urls {
-            if let task = downloads[url] {
-                downloads[url]?.status = .cancelled
-                downloads[url]?.job?.cancel()
-                try? FileManager.default.removeItem(atPath: task.filePath)
-                downloads.removeValue(forKey: url)
-                hasActive = true
-            }
-        }
-        return hasActive
-    }
-    
+    // MARK: - Progress and Status Methods
     func getDownloadStatus(url: String) -> [String: Any]? {
         downloadsLock.lock()
         defer { downloadsLock.unlock() }
@@ -482,10 +477,6 @@ class ParallelDownloadManager {
             "error": task.error ?? "",
             "speed": avgSpeed
         ]
-    }
-    
-    func getDownloadStatuses(urls: [String]) -> [[String: Any]] {
-        return urls.compactMap { getDownloadStatus(url: $0) }
     }
     
     func getBatchProgress() -> [String: Any]? {
@@ -539,14 +530,6 @@ class ParallelDownloadManager {
         ]
     }
     
-    func getAllDownloads() -> [[String: Any]] {
-        downloadsLock.lock()
-        let urls = Array(downloads.keys)
-        downloadsLock.unlock()
-        
-        return urls.compactMap { getDownloadStatus(url: $0) }
-    }
-    
     func clearCompletedDownloads() -> Bool {
         downloadsLock.lock()
         defer { downloadsLock.unlock() }
@@ -560,5 +543,97 @@ class ParallelDownloadManager {
         }
         
         return true
+    }
+
+    // MARK: - Private Helper Methods
+    private func extractFileName(url: String) -> String {
+        do {
+            if let uri = URL(string: url) {
+                let path = uri.path
+                let fileName = URL(fileURLWithPath: path).lastPathComponent
+
+
+                if !fileName.isEmpty && fileName.contains(".") {
+                    print("THIS IS FILE NAME: \(fileName)")
+                    return fileName
+                } else {
+                    print("download_\(Int64(Date().timeIntervalSince1970 * 1000)).tmp")
+                    return "download_\(Int64(Date().timeIntervalSince1970 * 1000)).tmp"
+                }
+            } else {
+                print("download_1\(Int64(Date().timeIntervalSince1970 * 1000)).tmp")
+                return "download_\(Int64(Date().timeIntervalSince1970 * 1000)).tmp"
+            }
+        } catch {
+            return "download_\(Int64(Date().timeIntervalSince1970 * 1000)).tmp"
+        }
+    }
+
+    private func sendProgress(task: MTDownloadTask, onProgress: ([String: Any]) -> Void) {
+        let currentTime = Date().timeIntervalSince1970 * 1000
+        let timeElapsed = max(1.0, currentTime - task.startTime)
+
+        let avgSpeed: Double
+        if !task.speedHistory.isEmpty {
+            avgSpeed = task.speedHistory.reduce(0, +) / Double(task.speedHistory.count)
+        } else {
+            avgSpeed = Double(task.downloadedBytes) * 1000.0 / timeElapsed
+        }
+
+        let progress = task.totalBytes > 0 ? Int(Double(task.downloadedBytes) * 100.0 / Double(task.totalBytes)) : -1
+
+        onProgress([
+            "url": task.url,
+            "filePath": task.filePath,
+            "progress": progress,
+            "bytesDownloaded": task.downloadedBytes,
+            "totalBytes": task.totalBytes,
+            "status": task.status.rawValue,
+            "error": task.error ?? "",
+            "speed": avgSpeed
+        ])
+    }
+
+    private func sendBatchProgress(onProgress: ([String: Any]) -> Void) {
+        if let batchProgress = getBatchProgress() {
+            var progress = batchProgress
+            progress["isBatchProgress"] = true
+            onProgress(progress)
+        }
+    }
+}
+
+// MARK: - Example Usage
+@available(iOS 15.0, *)
+class ExampleUsage {
+    private let downloadManager = ParallelDownloadManager()
+
+    func startExampleDownload() {
+        let urls = [
+            "https://example.com/file1.mp4",
+            "https://example.com/file2.pdf",
+            "https://example.com/stream.m3u8"
+        ]
+
+        let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].path
+
+        downloadManager.startBatchDownload(
+            urls: urls,
+            basePath: documentsPath,
+            headers: ["User-Agent": "MyApp/1.0"],
+            maxConcurrentTasks: 3,
+            retryCount: 3,
+            timeoutSeconds: 30,
+            onProgress: { progress in
+                if let isBatchProgress = progress["isBatchProgress"] as? Bool, isBatchProgress {
+                    print("Batch Progress: \(progress["overallProgress"] ?? 0)%")
+                } else {
+                    print("File Progress: \(progress["url"] ?? "") - \(progress["progress"] ?? 0)%")
+                }
+            },
+            onBatchComplete: {
+                print("All downloads completed!")
+            }
+        )
     }
 }
