@@ -1,36 +1,13 @@
 import Foundation
 
 
-// MARK: - Download Task Model
-@available(iOS 13.0, *)
-class MTDownloadTask {
-    let url: String
-    var filePath: String
-    let fileName: String
-    let headers: [String: String]
-    var status: MTDownloadStatus = .initializing
-    var downloadedBytes: Int64 = 0
-    var totalBytes: Int64 = 0
-    var startTime: Double = Date().timeIntervalSince1970 * 1000
-    var speedHistory: [Double] = []
-    var error: String?
-    var job: Task<Void, Error>?
-    var retryCount: Int = 3
-    var timeoutSeconds: Int = 30
-
-    init(url: String, filePath: String, fileName: String, headers: [String: String] = [:]) {
-        self.url = url
-        self.filePath = filePath
-        self.fileName = fileName
-        self.headers = headers
-    }
-}
 
 // MARK: - HTTPS Downloader
 @available(iOS 15.0, *)
 class HttpsDownloader {
 
     func downloadSingleFile(task: MTDownloadTask, onProgress: @escaping ([String: Any]) -> Void) async throws {
+        var task = task
         guard let url = URL(string: task.url) else {
             throw URLError(.badURL)
         }
@@ -138,6 +115,7 @@ class HttpsDownloader {
     }
 
     private func updateSpeedHistory(task: MTDownloadTask, currentTime: Double) {
+        var task = task
         let timeElapsed = max(1.0, currentTime - task.startTime)
         let currentSpeed = Double(task.downloadedBytes) * 1000.0 / timeElapsed
 
