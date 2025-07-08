@@ -7,7 +7,6 @@ import Foundation
 class HttpsDownloader {
 
     func downloadSingleFile(task: MTDownloadTask, onProgress: @escaping ([String: Any]) -> Void) async throws {
-        var task = task
         guard let url = URL(string: task.url) else {
             throw URLError(.badURL)
         }
@@ -115,7 +114,6 @@ class HttpsDownloader {
     }
 
     private func updateSpeedHistory(task: MTDownloadTask, currentTime: Double) {
-        var task = task
         let timeElapsed = max(1.0, currentTime - task.startTime)
         let currentSpeed = Double(task.downloadedBytes) * 1000.0 / timeElapsed
 
@@ -578,40 +576,5 @@ class ParallelDownloadManager {
             progress["isBatchProgress"] = true
             onProgress(progress)
         }
-    }
-}
-
-// MARK: - Example Usage
-@available(iOS 15.0, *)
-class ExampleUsage {
-    private let downloadManager = ParallelDownloadManager()
-
-    func startExampleDownload() {
-        let urls = [
-            "https://example.com/file1.mp4",
-            "https://example.com/file2.pdf",
-            "https://example.com/stream.m3u8"
-        ]
-
-        let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].path
-
-        downloadManager.startBatchDownload(
-            urls: urls,
-            basePath: documentsPath,
-            headers: ["User-Agent": "MyApp/1.0"],
-            maxConcurrentTasks: 3,
-            retryCount: 3,
-            timeoutSeconds: 30,
-            onProgress: { progress in
-                if let isBatchProgress = progress["isBatchProgress"] as? Bool, isBatchProgress {
-                    print("Batch Progress: \(progress["overallProgress"] ?? 0)%")
-                } else {
-                    print("File Progress: \(progress["url"] ?? "") - \(progress["progress"] ?? 0)%")
-                }
-            },
-            onBatchComplete: {
-                print("All downloads completed!")
-            }
-        )
     }
 }

@@ -175,150 +175,145 @@ class HighPerformanceHlsDownloader {
 
     // MARK: - Main Download Function
 
-    @available(iOS 15.0, *)
-    func downloadHlsStreamAdvanced(
-        task: MTDownloadTask,   // class instance, no inout
-        basePath: String,
-        onProgress: @escaping ([String: Any]) -> Void
-    ) async throws {
+   @available(iOS 15.0, *)
+   func downloadHlsStreamAdvanced(
+       task: MTDownloadTask,
+       basePath: String,
+       onProgress: @escaping ([String: Any]) -> Void
+   ) async throws {
 
-        var task = task
-        // Update task status & start time by mutating properties
-        task.status = .downloading
-        task.startTime = Date().timeIntervalSince1970
+       task.status = .downloading
+       task.startTime = Date().timeIntervalSince1970
 
-        let playlistDir = URL(fileURLWithPath: basePath)
-            .appendingPathComponent(task.fileName.replacingOccurrences(of: ".m3u8", with: ""))
+       let playlistDir = URL(fileURLWithPath: basePath)
+           .appendingPathComponent(task.fileName.replacingOccurrences(of: ".m3u8", with: ""))
 
-        try FileManager.default.createDirectory(at: playlistDir, withIntermediateDirectories: true)
+       try FileManager.default.createDirectory(at: playlistDir, withIntermediateDirectories: true)
 
-        guard let baseURL = URL(string: task.url) else {
-            throw NSError(domain: "Invalid URL", code: -1)
-        }
+       guard let baseURL = URL(string: task.url) else {
+           throw NSError(domain: "Invalid URL", code: -1)
+       }
 
-        let totalDownloadedBytes = AtomicInt64(0)
-        let downloadedSegments = AtomicInt(0)
-        let totalSegments = AtomicInt(0)
-        let isCompleted = AtomicBool(false)
+       let totalDownloadedBytes = AtomicInt64(0)
+       let downloadedSegments = AtomicInt(0)
+       let totalSegments = AtomicInt(0)
+       let isCompleted = AtomicBool(false)
 
-        do {
-            // Phase 1: Analyze HLS stream
-            print("Analyzing HLS stream...")
-            let (variants, avgSegmentSize) = try await analyzeHlsStream(
-                masterUrl: task.url,
-                headers: task.headers,
-                baseUri: baseURL
-            )
+       do {
+           // Phase 1: Analyze HLS stream
+           print("Analyzing HLS stream...")
+           let (variants, avgSegmentSize) = try await analyzeHlsStream(
+               masterUrl: task.url,
+               headers: task.headers,
+               baseUri: baseURL
+           )
 
-            // Phase 2: Configure
-            configLock.lock()
-            config.adapt(metrics: performanceMetrics, segmentSize: avgSegmentSize)
-            let currentConfig = config
-            configLock.unlock()
+           // Phase 2: Configure
+           configLock.lock()
+           config.adapt(metrics: performanceMetrics, segmentSize: avgSegmentSize)
+           let currentConfig = config
+           configLock.unlock()
 
-            // Phase 3: Create queues and channels
-            let segmentQueue = ThreadSafePriorityQueue<PrioritySegmentTask>()
-            let progressSubject = PassthroughSubject<ProgressUpdate, Never>()
+           // Phase 3: Create queues and channels
+           let segmentQueue = ThreadSafePriorityQueue<PrioritySegmentTask>()
+           let progressSubject = PassthroughSubject<ProgressUpdate, Never>()
 
-            // Phase 4: Process playlists first
-            print("Processing playlists...")
-            try await processVariantPlaylists(
-                variants: Array(variants.prefix(1)),
-                baseUri: baseURL,
-                headers: task.headers,
-                segmentQueue: segmentQueue,
-                totalSegments: totalSegments,
-                playlistDir: playlistDir
-            )
+           // Phase 4: Process playlists first
+           print("Processing playlists...")
+           try await processVariantPlaylists(
+               variants: Array(variants.prefix(1)),
+               baseUri: baseURL,
+               headers: task.headers,
+               segmentQueue: segmentQueue,
+               totalSegments: totalSegments,
+               playlistDir: playlistDir
+           )
 
-            print("Found \(totalSegments.value) segments to download")
+           print("Found \(totalSegments.value) segments to download")
 
-            if totalSegments.value == 0 {
-                throw NSError(domain: "No segments found in playlist", code: -1)
-            }
+           if totalSegments.value == 0 {
+               throw NSError(domain: "No segments found in playlist", code: -1)
+           }
 
-            // Phase 5: Launch download workers
-            print("Starting \(currentConfig.concurrentDownloaders) download workers...")
-            let semaphore = DispatchSemaphore(value: currentConfig.maxConnections)
+           // Phase 5: Launch download workers
+           print("Starting \(currentConfig.concurrentDownloaders) download workers...")
+           let semaphore = DispatchSemaphore(value: currentConfig.maxConnections)
 
-            await withTaskGroup(of: Void.self) { group in
-                // Download workers
-                for workerId in 0..<currentConfig.concurrentDownloaders {
-                    group.addTask {
-                        await self.downloadWorker(
-                            workerId: workerId,
-                            segmentQueue: segmentQueue,
-                            playlistDir: playlistDir,
-                            headers: task.headers,
-                            config: currentConfig,
-                            totalDownloadedBytes: totalDownloadedBytes,
-                            downloadedSegments: downloadedSegments,
-                            progressSubject: progressSubject,
-                            semaphore: semaphore,
-                            isCompleted: isCompleted
-                        )
-                    }
-                }
+           await withTaskGroup(of: Void.self) { group in
+               // Download workers
+               for workerId in 0..<currentConfig.concurrentDownloaders {
+                   group.addTask {
+                       await self.downloadWorker(
+                           workerId: workerId,
+                           segmentQueue: segmentQueue,
+                           playlistDir: playlistDir,
+                           headers: task.headers,
+                           config: currentConfig,
+                           totalDownloadedBytes: totalDownloadedBytes,
+                           downloadedSegments: downloadedSegments,
+                           progressSubject: progressSubject,
+                           semaphore: semaphore,
+                           isCompleted: isCompleted
+                       )
+                   }
+               }
 
-                // Progress monitor
-                group.addTask {
-                    await self.handleProgressUpdates(
-                        progressSubject: progressSubject,
-                        task: &task,  // pass task, mutate properties only
-                        totalDownloadedBytes: totalDownloadedBytes,
-                        downloadedSegments: downloadedSegments,
-                        totalSegments: totalSegments,
-                        onProgress: onProgress
-                    )
-                }
+               // Progress monitor
+               group.addTask {
+                   await self.handleProgressUpdates(
+                       progressSubject: progressSubject,
+                       task: task,  // ✅ no inout
+                       totalDownloadedBytes: totalDownloadedBytes,
+                       downloadedSegments: downloadedSegments,
+                       totalSegments: totalSegments,
+                       onProgress: onProgress
+                   )
+               }
 
-                // Performance monitor
-                group.addTask {
-                    await self.monitorPerformance(
-                        totalDownloadedBytes: totalDownloadedBytes,
-                        startTime: task.startTime
-                    )
-                }
+               // Performance monitor
+               group.addTask {
+                   await self.monitorPerformance(
+                       totalDownloadedBytes: totalDownloadedBytes,
+                       startTime: task.startTime
+                   )
+               }
 
-                // Wait for completion
-                group.addTask {
-                    while downloadedSegments.value < totalSegments.value {
-                        try? await Task.sleep(nanoseconds: 500_000_000)
-                        print("Progress: \(downloadedSegments.value)/\(totalSegments.value) segments downloaded")
-                    }
+               // Completion checker
+               group.addTask {
+                   while downloadedSegments.value < totalSegments.value {
+                       try? await Task.sleep(nanoseconds: 500_000_000)
+                       print("Progress: \(downloadedSegments.value)/\(totalSegments.value) segments downloaded")
+                   }
 
-                    // Mark completion
-                    isCompleted.setValue(true)
+                   isCompleted.setValue(true)
 
-                    // Signal workers to stop
-                    for _ in 0..<currentConfig.concurrentDownloaders {
-                        segmentQueue.offer(PrioritySegmentTask(
-                            segment: SegmentTask(url: "", fileName: ""),
-                            priority: -1,
-                            segmentIndex: -1
-                        ))
-                    }
-                }
-            }
+                   for _ in 0..<currentConfig.concurrentDownloaders {
+                       segmentQueue.offer(PrioritySegmentTask(
+                           segment: SegmentTask(url: "", fileName: ""),
+                           priority: -1,
+                           segmentIndex: -1
+                       ))
+                   }
+               }
+           }
 
-            // Phase 9: Create final playlists
-            try createMasterPlaylist(variants: Array(variants.prefix(1)), playlistDir: playlistDir)
+           // Phase 9: Final playlist creation
+           try createMasterPlaylist(variants: Array(variants.prefix(1)), playlistDir: playlistDir)
 
-            // Update final task state (mutate properties only)
-            task.status = .completed
-            task.downloadedBytes = totalDownloadedBytes.value
-            task.filePath = playlistDir.appendingPathComponent("master.m3u8").path
-            sendProgress(task: &task, onProgress: onProgress)
+           // Update final state
+           task.status = .completed
+           task.downloadedBytes = totalDownloadedBytes.value
+           task.filePath = playlistDir.appendingPathComponent("master.m3u8").path
+           sendProgress(task: task, onProgress: onProgress)
 
-        } catch {
-            // Handle failure (mutate properties only)
-            isCompleted.setValue(true)
-            task.status = .failed
-            task.error = error.localizedDescription
-            sendProgress(task: &task, onProgress: onProgress)
-            throw error
-        }
-    }
+       } catch {
+           isCompleted.setValue(true)
+           task.status = .failed
+           task.error = error.localizedDescription
+           sendProgress(task: task, onProgress: onProgress)
+           throw error
+       }
+   }
 
 
     // MARK: - Helper Methods
@@ -618,7 +613,7 @@ class HighPerformanceHlsDownloader {
     @available(iOS 15.0, *)
     private func handleProgressUpdates(
         progressSubject: PassthroughSubject<ProgressUpdate, Never>,
-        task: inout MTDownloadTask,
+        task: MTDownloadTask,
         totalDownloadedBytes: AtomicInt64,
         downloadedSegments: AtomicInt,
         totalSegments: AtomicInt,
@@ -640,7 +635,7 @@ class HighPerformanceHlsDownloader {
                     task.totalBytes = avgBytesPerSegment * Int64(totalSegments.value)
                 }
 
-                sendProgress(task: &task, onProgress: onProgress)
+                sendProgress(task: task, onProgress: onProgress)
                 lastUpdate = now
             }
 
@@ -919,7 +914,7 @@ class HighPerformanceHlsDownloader {
         try masterContent.write(to: masterFile, atomically: true, encoding: .utf8)
     }
 
-    private func sendProgress(task: inout MTDownloadTask, onProgress: ([String: Any]) -> Void) {
+    private func sendProgress(task: MTDownloadTask, onProgress: ([String: Any]) -> Void) {
         let currentTime = Date().timeIntervalSince1970
         let timeElapsed = max(1.0, currentTime - task.startTime)
         let currentSpeed = Double(task.downloadedBytes) * 1000.0 / timeElapsed
