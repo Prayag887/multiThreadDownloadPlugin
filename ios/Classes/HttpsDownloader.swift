@@ -7,8 +7,6 @@ class MTHttpsDownloader {
         task: MTDownloadTask,
         onProgress: @escaping ([String: Any]) -> Void
     ) async throws {
-        var task = task
-
         let fileURL = URL(fileURLWithPath: task.filePath)
         try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
 
