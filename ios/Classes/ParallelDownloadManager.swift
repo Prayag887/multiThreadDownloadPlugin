@@ -1,7 +1,5 @@
 import Foundation
 
-
-
 // MARK: - HTTPS Downloader
 @available(iOS 15.0, *)
 class HttpsDownloader {
@@ -68,7 +66,7 @@ class HttpsDownloader {
             }
 
             var lastProgressTime = startTime
-            let progressInterval: Double = 500 // Update every 500ms
+            let progressInterval: Double = 100 // Update every 100ms
 
             // Download data
             var buffer = Data()
