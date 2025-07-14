@@ -114,36 +114,184 @@ struct ProgressUpdate {
     let success: Bool
 }
 
-// MARK: - Thread-Safe Collections
+// MARK: - Async-Safe Thread-Safe Collections
 
-class ThreadSafePriorityQueue<T: Comparable> {
+@available(iOS 13.0, *)
+actor AsyncPriorityQueue<T: Comparable> {
     private var heap: [T] = []
-    private let lock = NSLock()
-    private let semaphore = DispatchSemaphore(value: 0)
+    private var waitingTasks: [CheckedContinuation<T?, Never>] = []
 
     var isEmpty: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return heap.isEmpty
+        heap.isEmpty
     }
 
     func offer(_ element: T) {
-        lock.lock()
         heap.append(element)
         heap.sort()
-        lock.unlock()
-        semaphore.signal()
+        
+        // Resume any waiting tasks
+        if !waitingTasks.isEmpty {
+            let continuation = waitingTasks.removeFirst()
+            if !heap.isEmpty {
+                continuation.resume(returning: heap.removeFirst())
+            } else {
+                continuation.resume(returning: nil)
+            }
+        }
     }
 
-    func poll(timeout: TimeInterval) -> T? {
-        let timeoutTime = DispatchTime.now() + timeout
-
-        if semaphore.wait(timeout: timeoutTime) == .success {
-            lock.lock()
-            defer { lock.unlock() }
-            return heap.isEmpty ? nil : heap.removeFirst()
+    func poll() async -> T? {
+        if !heap.isEmpty {
+            return heap.removeFirst()
         }
-        return nil
+        
+        return await withCheckedContinuation { continuation in
+            waitingTasks.append(continuation)
+        }
+    }
+    
+    func pollWithTimeout(timeout: TimeInterval) async -> T? {
+        if !heap.isEmpty {
+            return heap.removeFirst()
+        }
+        
+        // Fix: Use proper actor isolation for timeout polling
+        return await withTaskGroup(of: T?.self) { group in
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                return nil
+            }
+            
+            group.addTask {
+                // Call the regular poll method which properly handles actor isolation
+                return await self.poll()
+            }
+            
+            // Get first result
+            guard let result = await group.next() else {
+                group.cancelAll()
+                return nil
+            }
+            
+            // Cancel remaining tasks
+            group.cancelAll()
+            
+            // If result is nil (timeout), clean up waiting tasks
+            if result == nil {
+                await self.cleanupWaitingTasks()
+            }
+            
+            return result
+        }
+    }
+    
+    // Fix: Add isolated method to safely clean up waiting tasks
+    private func cleanupWaitingTasks() async {
+        for continuation in waitingTasks {
+            continuation.resume(returning: nil)
+        }
+        waitingTasks.removeAll()
+    }
+}
+
+// MARK: - Async-Safe Atomic Types
+
+@available(iOS 13.0, *)
+actor AsyncAtomicInt {
+    private var _value: Int = 0
+
+    init(_ value: Int = 0) {
+        _value = value
+    }
+
+    var value: Int {
+        _value
+    }
+
+    func add(_ amount: Int) {
+        _value += amount
+    }
+
+    func increment() {
+        _value += 1
+    }
+
+    func setValue(_ newValue: Int) {
+        _value = newValue
+    }
+}
+
+@available(iOS 13.0, *)
+actor AsyncAtomicInt64 {
+    private var _value: Int64 = 0
+
+    init(_ value: Int64 = 0) {
+        _value = value
+    }
+
+    var value: Int64 {
+        _value
+    }
+
+    func add(_ amount: Int64) {
+        _value += amount
+    }
+
+    func setValue(_ newValue: Int64) {
+        _value = newValue
+    }
+}
+
+@available(iOS 13.0, *)
+actor AsyncAtomicBool {
+    private var _value: Bool = false
+
+    init(_ value: Bool = false) {
+        _value = value
+    }
+
+    var value: Bool {
+        _value
+    }
+
+    func setValue(_ newValue: Bool) {
+        _value = newValue
+    }
+}
+
+// MARK: - Async-Safe Performance Metrics Actor
+
+@available(iOS 13.0, *)
+actor PerformanceMetricsActor {
+    private var metrics = PerformanceMetrics()
+    
+    func getMetrics() -> PerformanceMetrics {
+        metrics
+    }
+    
+    func updateSpeed(_ speed: Double, at time: TimeInterval) {
+        metrics.speedHistory.append(speed)
+        if metrics.speedHistory.count > 20 {
+            metrics.speedHistory.removeFirst()
+        }
+        
+        metrics.avgDownloadSpeed = metrics.speedHistory.reduce(0, +) / Double(metrics.speedHistory.count)
+        metrics.lastSpeedUpdate = time
+    }
+}
+
+// MARK: - Async-Safe Config Actor
+
+@available(iOS 13.0, *)
+actor ConfigActor {
+    private var config = AdaptiveConfig()
+    
+    func getConfig() -> AdaptiveConfig {
+        config
+    }
+    
+    func adaptConfig(metrics: PerformanceMetrics, segmentSize: Int64) {
+        config.adapt(metrics: metrics, segmentSize: segmentSize)
     }
 }
 
@@ -155,10 +303,8 @@ class HighPerformanceHlsDownloader {
     // MARK: - Properties
 
     private let session: URLSession
-    private var performanceMetrics = PerformanceMetrics()
-    private var config = AdaptiveConfig()
-    private let metricsLock = NSLock()
-    private let configLock = NSLock()
+    private let metricsActor = PerformanceMetricsActor()
+    private let configActor = ConfigActor()
 
     // MARK: - Initialization
 
@@ -194,10 +340,10 @@ class HighPerformanceHlsDownloader {
            throw NSError(domain: "Invalid URL", code: -1)
        }
 
-       let totalDownloadedBytes = AtomicInt64(0)
-       let downloadedSegments = AtomicInt(0)
-       let firstVariantSegmentCount = AtomicInt(0) // Track first variant segment count
-       let isCompleted = AtomicBool(false)
+       let totalDownloadedBytes = AsyncAtomicInt64(0)
+       let downloadedSegments = AsyncAtomicInt(0)
+       let firstVariantSegmentCount = AsyncAtomicInt(0) // Track first variant segment count
+       let isCompleted = AsyncAtomicBool(false)
 
        do {
            // Phase 1: Analyze HLS stream
@@ -209,13 +355,12 @@ class HighPerformanceHlsDownloader {
            )
 
            // Phase 2: Configure
-           configLock.lock()
-           config.adapt(metrics: performanceMetrics, segmentSize: avgSegmentSize)
-           let currentConfig = config
-           configLock.unlock()
+           let currentMetrics = await metricsActor.getMetrics()
+           await configActor.adaptConfig(metrics: currentMetrics, segmentSize: avgSegmentSize)
+           let currentConfig = await configActor.getConfig()
 
            // Phase 3: Create queues and channels
-           let segmentQueue = ThreadSafePriorityQueue<PrioritySegmentTask>()
+           let segmentQueue = AsyncPriorityQueue<PrioritySegmentTask>()
            let progressSubject = PassthroughSubject<ProgressUpdate, Never>()
 
            // Phase 4: Process only the first playlist (first variant only)
@@ -229,9 +374,10 @@ class HighPerformanceHlsDownloader {
                playlistDir: playlistDir
            )
 
-           print("Found \(firstVariantSegmentCount.value) segments to download in first variant")
+           let segmentCount = await firstVariantSegmentCount.value
+           print("Found \(segmentCount) segments to download in first variant")
 
-           if firstVariantSegmentCount.value == 0 {
+           if segmentCount == 0 {
                throw NSError(domain: "No segments found in first variant", code: -1)
            }
 
@@ -280,17 +426,19 @@ class HighPerformanceHlsDownloader {
 
                // Completion checker - Complete after first variant is downloaded
                group.addTask {
-                   while downloadedSegments.value < firstVariantSegmentCount.value {
+                   let targetCount = await firstVariantSegmentCount.value
+                   while await downloadedSegments.value < targetCount {
                        try? await Task.sleep(nanoseconds: 500_000_000)
-                       print("Progress: \(downloadedSegments.value)/\(firstVariantSegmentCount.value) segments downloaded (first variant only)")
+                       let current = await downloadedSegments.value
+                       print("Progress: \(current)/\(targetCount) segments downloaded (first variant only)")
                    }
 
                    print("First variant download completed!")
-                   isCompleted.setValue(true)
+                   await isCompleted.setValue(true)
 
                    // Send termination signals to all workers
                    for _ in 0..<currentConfig.concurrentDownloaders {
-                       segmentQueue.offer(PrioritySegmentTask(
+                       await segmentQueue.offer(PrioritySegmentTask(
                            segment: SegmentTask(url: "", fileName: ""),
                            priority: -1,
                            segmentIndex: -1
@@ -304,20 +452,18 @@ class HighPerformanceHlsDownloader {
 
            // Update final state
            task.status = .completed
-           task.downloadedBytes = totalDownloadedBytes.value
+           task.downloadedBytes = await totalDownloadedBytes.value
            task.filePath = playlistDir.appendingPathComponent("master.m3u8").path
            sendProgress(task: task, onProgress: onProgress)
 
        } catch {
-           isCompleted.setValue(true)
+           await isCompleted.setValue(true)
            task.status = .failed
            task.error = error.localizedDescription
            sendProgress(task: task, onProgress: onProgress)
            throw error
        }
    }
-
-
 
     // MARK: - Helper Methods
 
@@ -338,8 +484,8 @@ class HighPerformanceHlsDownloader {
         variants: [VariantPlaylist],
         baseUri: URL,
         headers: [String: String],
-        segmentQueue: ThreadSafePriorityQueue<PrioritySegmentTask>,
-        totalSegments: AtomicInt,
+        segmentQueue: AsyncPriorityQueue<PrioritySegmentTask>,
+        totalSegments: AsyncAtomicInt,
         playlistDir: URL
     ) async throws {
 
@@ -366,8 +512,8 @@ class HighPerformanceHlsDownloader {
         variant: VariantPlaylist,
         baseUri: URL,
         headers: [String: String],
-        segmentQueue: ThreadSafePriorityQueue<PrioritySegmentTask>,
-        totalSegments: AtomicInt,
+        segmentQueue: AsyncPriorityQueue<PrioritySegmentTask>,
+        totalSegments: AsyncAtomicInt,
         variantIndex: Int,
         playlistDir: URL
     ) async throws {
@@ -384,13 +530,13 @@ class HighPerformanceHlsDownloader {
             let segments = parseVariantPlaylist(content: variantContent, baseUri: variantUri, variantName: variant.fileName)
             print("Found \(segments.count) segments in variant")
 
-            totalSegments.add(segments.count)
+            await totalSegments.add(segments.count)
 
             // Create prioritized tasks
             for (index, segment) in segments.enumerated() {
                 let priority = calculateSegmentPriority(index: index, totalSegments: segments.count, variantIndex: variantIndex)
                 let priorityTask = PrioritySegmentTask(segment: segment, priority: priority, segmentIndex: index)
-                segmentQueue.offer(priorityTask)
+                await segmentQueue.offer(priorityTask)
             }
 
             // Create local playlist asynchronously
@@ -406,21 +552,21 @@ class HighPerformanceHlsDownloader {
 
     private func downloadWorker(
         workerId: Int,
-        segmentQueue: ThreadSafePriorityQueue<PrioritySegmentTask>,
+        segmentQueue: AsyncPriorityQueue<PrioritySegmentTask>,
         playlistDir: URL,
         headers: [String: String],
         config: AdaptiveConfig,
-        totalDownloadedBytes: AtomicInt64,
-        downloadedSegments: AtomicInt,
+        totalDownloadedBytes: AsyncAtomicInt64,
+        downloadedSegments: AsyncAtomicInt,
         progressSubject: PassthroughSubject<ProgressUpdate, Never>,
         semaphore: DispatchSemaphore,
-        isCompleted: AtomicBool
+        isCompleted: AsyncAtomicBool
     ) async {
 
-        while !isCompleted.value {
+        while await !isCompleted.value {
             // Poll for work with timeout
-            guard let priorityTask = segmentQueue.poll(timeout: 1.0) else {
-                if !isCompleted.value {
+            guard let priorityTask = await segmentQueue.pollWithTimeout(timeout: 1.0) else {
+                if await !isCompleted.value {
                     try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
                     continue
                 } else {
@@ -448,8 +594,8 @@ class HighPerformanceHlsDownloader {
                 )
                 let downloadTime = Date().timeIntervalSince1970 - startTime
 
-                totalDownloadedBytes.add(bytesDownloaded)
-                downloadedSegments.increment()
+                await totalDownloadedBytes.add(bytesDownloaded)
+                await downloadedSegments.increment()
 
                 progressSubject.send(ProgressUpdate(
                     bytesDownloaded: bytesDownloaded,
@@ -462,7 +608,7 @@ class HighPerformanceHlsDownloader {
                     priorityTask.retryCount += 1
                     let delay = pow(2.0, Double(priorityTask.retryCount)) * 0.2
                     try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-                    segmentQueue.offer(priorityTask)
+                    await segmentQueue.offer(priorityTask)
                 } else {
                     priorityTask.failed = true
                     progressSubject.send(ProgressUpdate(bytesDownloaded: 0, downloadTime: 0, success: false))
@@ -617,8 +763,8 @@ class HighPerformanceHlsDownloader {
         variants: [VariantPlaylist],
         baseUri: URL,
         headers: [String: String],
-        segmentQueue: ThreadSafePriorityQueue<PrioritySegmentTask>,
-        firstVariantSegmentCount: AtomicInt,
+        segmentQueue: AsyncPriorityQueue<PrioritySegmentTask>,
+        firstVariantSegmentCount: AsyncAtomicInt,
         playlistDir: URL
     ) async throws {
 
@@ -638,13 +784,13 @@ class HighPerformanceHlsDownloader {
             let segments = parseVariantPlaylist(content: variantContent, baseUri: variantUri, variantName: firstVariant.fileName)
             print("Found \(segments.count) segments in first variant")
 
-            firstVariantSegmentCount.setValue(segments.count)
+            await firstVariantSegmentCount.setValue(segments.count)
 
             // Create prioritized tasks for first variant only
             for (index, segment) in segments.enumerated() {
                 let priority = calculateSegmentPriority(index: index, totalSegments: segments.count, variantIndex: 0)
                 let priorityTask = PrioritySegmentTask(segment: segment, priority: priority, segmentIndex: index)
-                segmentQueue.offer(priorityTask)
+                await segmentQueue.offer(priorityTask)
             }
 
             // Create local playlist for first variant
@@ -663,9 +809,9 @@ class HighPerformanceHlsDownloader {
     private func handleProgressUpdatesFirstVariant(
         progressSubject: PassthroughSubject<ProgressUpdate, Never>,
         task: MTDownloadTask,
-        totalDownloadedBytes: AtomicInt64,
-        downloadedSegments: AtomicInt,
-        firstVariantSegmentCount: AtomicInt,
+        totalDownloadedBytes: AsyncAtomicInt64,
+        downloadedSegments: AsyncAtomicInt,
+        firstVariantSegmentCount: AsyncAtomicInt,
         onProgress: @escaping ([String: Any]) -> Void
     ) async {
 
@@ -674,14 +820,16 @@ class HighPerformanceHlsDownloader {
 
         for await _ in progressSubject.values {
             let now = Date().timeIntervalSince1970
+            let downloadedCount = await downloadedSegments.value
+            let totalCount = await firstVariantSegmentCount.value
 
-            if now - lastUpdate >= updateInterval || downloadedSegments.value >= firstVariantSegmentCount.value {
-                task.downloadedBytes = totalDownloadedBytes.value
+            if now - lastUpdate >= updateInterval || downloadedCount >= totalCount {
+                task.downloadedBytes = await totalDownloadedBytes.value
 
                 // Estimate total size based on first variant only
-                if task.totalBytes <= 0 && downloadedSegments.value > 0 {
-                    let avgBytesPerSegment = totalDownloadedBytes.value / Int64(downloadedSegments.value)
-                    task.totalBytes = avgBytesPerSegment * Int64(firstVariantSegmentCount.value)
+                if task.totalBytes <= 0 && downloadedCount > 0 {
+                    let avgBytesPerSegment = task.downloadedBytes / Int64(downloadedCount)
+                    task.totalBytes = avgBytesPerSegment * Int64(totalCount)
                 }
 
                 sendProgress(task: task, onProgress: onProgress)
@@ -689,14 +837,14 @@ class HighPerformanceHlsDownloader {
             }
 
             // Break if all segments of first variant are downloaded
-            if downloadedSegments.value >= firstVariantSegmentCount.value && firstVariantSegmentCount.value > 0 {
+            if downloadedCount >= totalCount && totalCount > 0 {
                 break
             }
         }
     }
 
     private func monitorPerformance(
-        totalDownloadedBytes: AtomicInt64,
+        totalDownloadedBytes: AsyncAtomicInt64,
         startTime: TimeInterval
     ) async {
 
@@ -705,17 +853,10 @@ class HighPerformanceHlsDownloader {
 
             let currentTime = Date().timeIntervalSince1970
             let timeElapsed = currentTime - startTime
-            let currentSpeed = Double(totalDownloadedBytes.value) * 1000.0 / timeElapsed
+            let bytesDownloaded = await totalDownloadedBytes.value
+            let currentSpeed = Double(bytesDownloaded) * 1000.0 / timeElapsed
 
-            metricsLock.lock()
-            performanceMetrics.speedHistory.append(currentSpeed)
-            if performanceMetrics.speedHistory.count > 20 {
-                performanceMetrics.speedHistory.removeFirst()
-            }
-
-            performanceMetrics.avgDownloadSpeed = performanceMetrics.speedHistory.reduce(0, +) / Double(performanceMetrics.speedHistory.count)
-            performanceMetrics.lastSpeedUpdate = currentTime
-            metricsLock.unlock()
+            await metricsActor.updateSpeed(currentSpeed, at: currentTime)
         }
     }
 
@@ -1004,26 +1145,24 @@ class HighPerformanceHlsDownloader {
     }
 }
 
-// MARK: - Atomic Types
+// MARK: - Legacy Atomic Types (for compatibility with existing MTDownloadTask)
 
 class AtomicInt {
+    private let queue = DispatchQueue(label: "AtomicInt", attributes: .concurrent)
     private var _value: Int = 0
-    private let lock = NSLock()
 
     init(_ value: Int = 0) {
         _value = value
     }
 
     var value: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return _value
+        queue.sync { _value }
     }
 
     func add(_ amount: Int) {
-        lock.lock()
-        _value += amount
-        lock.unlock()
+        queue.async(flags: .barrier) {
+            self._value += amount
+        }
     }
 
     func increment() {
@@ -1031,56 +1170,52 @@ class AtomicInt {
     }
 
     func setValue(_ newValue: Int) {
-        lock.lock()
-        _value = newValue
-        lock.unlock()
+        queue.async(flags: .barrier) {
+            self._value = newValue
+        }
     }
 }
 
 class AtomicInt64 {
+    private let queue = DispatchQueue(label: "AtomicInt64", attributes: .concurrent)
     private var _value: Int64 = 0
-    private let lock = NSLock()
 
     init(_ value: Int64 = 0) {
         _value = value
     }
 
     var value: Int64 {
-        lock.lock()
-        defer { lock.unlock() }
-        return _value
+        queue.sync { _value }
     }
 
     func add(_ amount: Int64) {
-        lock.lock()
-        _value += amount
-        lock.unlock()
+        queue.async(flags: .barrier) {
+            self._value += amount
+        }
     }
 
     func setValue(_ newValue: Int64) {
-        lock.lock()
-        _value = newValue
-        lock.unlock()
+        queue.async(flags: .barrier) {
+            self._value = newValue
+        }
     }
 }
 
 class AtomicBool {
+    private let queue = DispatchQueue(label: "AtomicBool", attributes: .concurrent)
     private var _value: Bool = false
-    private let lock = NSLock()
 
     init(_ value: Bool = false) {
         _value = value
     }
 
     var value: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return _value
+        queue.sync { _value }
     }
 
     func setValue(_ newValue: Bool) {
-        lock.lock()
-        _value = newValue
-        lock.unlock()
+        queue.async(flags: .barrier) {
+            self._value = newValue
+        }
     }
 }

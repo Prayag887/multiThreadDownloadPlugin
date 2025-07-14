@@ -7,7 +7,6 @@ class MTHttpsDownloader {
         task: MTDownloadTask,
         onProgress: @escaping ([String: Any]) -> Void
     ) async throws {
-        var task = task
 
         let fileURL = URL(fileURLWithPath: task.filePath)
         try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -141,7 +140,6 @@ class MTHttpsDownloader {
     }
 
     private func updateSpeedHistory(task: MTDownloadTask, bytes: Int64, timeMs: Int64) {
-        var task = task
         let speed = timeMs > 0 ? (Double(bytes) * 1000.0 / Double(timeMs)) : 0.0
         task.speedHistory.append(speed)
         if task.speedHistory.count > 10 {
