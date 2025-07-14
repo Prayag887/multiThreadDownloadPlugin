@@ -9,21 +9,20 @@ public class MultithreadDownloadsPlugin: NSObject, FlutterPlugin, FlutterStreamH
     private var eventSink: FlutterEventSink?
     private let downloadManager = ParallelDownloadManager()
 
-    // Thread-safe queue using serial dispatch queue
     private let queueAccessQueue = DispatchQueue(label: "download.queue.access", qos: .utility)
     private var downloadQueue: [DownloadRequest] = []
     private var isProcessingQueue = false
 
-    struct DownloadRequest {
-        let urls: [String]
-        let filePath: String
-        let headers: [String: String]
-        let maxConcurrentTasks: Int
-        let retryCount: Int
-        let timeoutSeconds: Int
-        let requestId: String
+    public struct DownloadRequest {
+        public let urls: [String]
+        public let filePath: String
+        public let headers: [String: String]
+        public let maxConcurrentTasks: Int
+        public let retryCount: Int
+        public let timeoutSeconds: Int
+        public let requestId: String
 
-        init(urls: [String], filePath: String, headers: [String: String],
+        public init(urls: [String], filePath: String, headers: [String: String],
              maxConcurrentTasks: Int, retryCount: Int, timeoutSeconds: Int) {
             self.urls = urls
             self.filePath = filePath
@@ -31,7 +30,7 @@ public class MultithreadDownloadsPlugin: NSObject, FlutterPlugin, FlutterStreamH
             self.maxConcurrentTasks = maxConcurrentTasks
             self.retryCount = retryCount
             self.timeoutSeconds = timeoutSeconds
-            self.requestId = String(Int64(Date().timeIntervalSince1970 * 1000))
+            self.requestId = UUID().uuidString
         }
     }
 
@@ -79,12 +78,6 @@ public class MultithreadDownloadsPlugin: NSObject, FlutterPlugin, FlutterStreamH
         case "pauseAllDownloads":
             result(downloadManager.pauseAllDownloads())
 
-//        case "resumeAllDownloads":
-//            downloadManager.resumeAllDownloads { [weak self] progress in
-//                self?.sendProgress(progress: progress)
-//            }
-//            result(true)
-
         case "cancelAllDownloads":
             let cancelled = downloadManager.cancelAllDownloads()
             queueAccessQueue.sync {
@@ -94,33 +87,6 @@ public class MultithreadDownloadsPlugin: NSObject, FlutterPlugin, FlutterStreamH
             sendQueueStatus()
             result(cancelled)
 
-//        case "pauseDownloads":
-//            guard let args = call.arguments as? [String: Any],
-//                  let urls = args["urls"] as? [String] else {
-//                result(false)
-//                return
-//            }
-//            result(downloadManager.pauseDownloads(urls: urls))
-//
-//        case "resumeDownloads":
-//            guard let args = call.arguments as? [String: Any],
-//                  let urls = args["urls"] as? [String] else {
-//                result(false)
-//                return
-//            }
-//            downloadManager.resumeDownloads(urls: urls) { [weak self] progress in
-//                self?.sendProgress(progress: progress)
-//            }
-//            result(true)
-
-//        case "cancelDownloads":
-//            guard let args = call.arguments as? [String: Any],
-//                  let urls = args["urls"] as? [String] else {
-//                result(false)
-//                return
-//            }
-//            result(downloadManager.cancelDownloads(urls: urls))
-
         case "getDownloadStatus":
             guard let args = call.arguments as? [String: Any],
                   let url = args["url"] as? String else {
@@ -128,17 +94,6 @@ public class MultithreadDownloadsPlugin: NSObject, FlutterPlugin, FlutterStreamH
                 return
             }
             result(downloadManager.getDownloadStatus(url: url))
-
-//        case "getDownloadStatuses":
-//            guard let args = call.arguments as? [String: Any],
-//                  let urls = args["urls"] as? [String] else {
-//                result([])
-//                return
-//            }
-//            result(downloadManager.getDownloadStatuses(urls: urls))
-
-//        case "getAllDownloads":
-//            result(downloadManager.getAllDownloads())
 
         case "getBatchProgress":
             result(downloadManager.getBatchProgress())
@@ -182,8 +137,6 @@ public class MultithreadDownloadsPlugin: NSObject, FlutterPlugin, FlutterStreamH
         let retryCount = args["retryCount"] as? Int ?? 3
         let timeoutSeconds = args["timeoutSeconds"] as? Int ?? 30
 
-        print("headers::: \(headers)")
-
         let downloadRequest = DownloadRequest(
             urls: urls,
             filePath: filePath,
@@ -193,16 +146,12 @@ public class MultithreadDownloadsPlugin: NSObject, FlutterPlugin, FlutterStreamH
             timeoutSeconds: timeoutSeconds
         )
 
-        // Add to queue
         queueAccessQueue.sync {
             downloadQueue.append(downloadRequest)
             print("Added download request to queue. Queue size: \(downloadQueue.count)")
         }
 
-        // Send queue status update
         sendQueueStatus()
-
-        // Process queue
         processDownloadQueue()
 
         let queueSize = queueAccessQueue.sync { downloadQueue.count }
@@ -240,7 +189,11 @@ public class MultithreadDownloadsPlugin: NSObject, FlutterPlugin, FlutterStreamH
             return
         }
 
-        print("Processing download request with \(request.urls.count) URLs")
+        print("Processing download request: \(request.requestId)")
+
+        sendBatchEvent(requestId: request.requestId,
+                      status: "started",
+                      urls: request.urls)
 
         downloadManager.startBatchDownload(
             urls: request.urls,
@@ -250,18 +203,28 @@ public class MultithreadDownloadsPlugin: NSObject, FlutterPlugin, FlutterStreamH
             retryCount: request.retryCount,
             timeoutSeconds: request.timeoutSeconds,
             onProgress: { [weak self] progress in
-                self?.sendProgress(progress: progress)
+                var enhancedProgress = progress
+                enhancedProgress["requestId"] = request.requestId
+                enhancedProgress["isBatchProgress"] = true
+                self?.sendProgress(progress: enhancedProgress)
             },
             onBatchComplete: { [weak self] in
-                print("Batch completed, processing next item in queue")
-                self?.queueAccessQueue.sync {
-                    self?.isProcessingQueue = false
-                }
-                self?.sendQueueStatus()
+                guard let self = self else { return }
 
-                // Small delay to ensure cleanup is complete before processing next batch
+                print("Batch \(request.requestId) completed")
+
+                self.sendBatchEvent(requestId: request.requestId,
+                                    status: "completed",
+                                    urls: request.urls)
+
+                self.queueAccessQueue.sync {
+                    self.isProcessingQueue = false
+                }
+
+                self.sendQueueStatus()
+
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    self?.processDownloadQueue()
+                    self.processDownloadQueue()
                 }
             }
         )
@@ -269,13 +232,26 @@ public class MultithreadDownloadsPlugin: NSObject, FlutterPlugin, FlutterStreamH
         sendQueueStatus()
     }
 
+    private func sendBatchEvent(requestId: String, status: String, urls: [String]) {
+        let event: [String: Any] = [
+            "batchEvent": true,
+            "requestId": requestId,
+            "status": status,
+            "totalSegments": urls.count,
+            "timestamp": Date().timeIntervalSince1970
+        ]
+        sendProgress(progress: event)
+    }
+
     private func getQueueStatus() -> [String: Any] {
         return queueAccessQueue.sync {
-            [
+            let currentRequestId = downloadQueue.first?.requestId ?? "none"
+
+            return [
                 "queueSize": downloadQueue.count,
                 "isProcessing": isProcessingQueue,
+                "currentRequestId": currentRequestId,
                 "isBatchActive": downloadManager.isBatchActive(),
-                "currentBatchComplete": downloadManager.isBatchComplete(),
                 "isReadyForNewBatch": downloadManager.isReadyForNewBatch()
             ]
         }
@@ -287,11 +263,8 @@ public class MultithreadDownloadsPlugin: NSObject, FlutterPlugin, FlutterStreamH
         sendProgress(progress: queueStatus)
     }
 
-    // MARK: - FlutterStreamHandler
-
     public func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink) -> FlutterError? {
         eventSink = events
-        // Send initial queue status
         sendQueueStatus()
         return nil
     }

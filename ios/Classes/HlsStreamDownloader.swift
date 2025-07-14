@@ -196,7 +196,7 @@ class HighPerformanceHlsDownloader {
 
        let totalDownloadedBytes = AtomicInt64(0)
        let downloadedSegments = AtomicInt(0)
-       let totalSegments = AtomicInt(0)
+       let firstVariantSegmentCount = AtomicInt(0) // Track first variant segment count
        let isCompleted = AtomicBool(false)
 
        do {
@@ -218,21 +218,21 @@ class HighPerformanceHlsDownloader {
            let segmentQueue = ThreadSafePriorityQueue<PrioritySegmentTask>()
            let progressSubject = PassthroughSubject<ProgressUpdate, Never>()
 
-           // Phase 4: Process playlists first
-           print("Processing playlists...")
-           try await processVariantPlaylists(
+           // Phase 4: Process only the first playlist (first variant only)
+           print("Processing first variant only...")
+           try await processFirstVariantPlaylist(
                variants: Array(variants.prefix(1)),
                baseUri: baseURL,
                headers: task.headers,
                segmentQueue: segmentQueue,
-               totalSegments: totalSegments,
+               firstVariantSegmentCount: firstVariantSegmentCount,
                playlistDir: playlistDir
            )
 
-           print("Found \(totalSegments.value) segments to download")
+           print("Found \(firstVariantSegmentCount.value) segments to download in first variant")
 
-           if totalSegments.value == 0 {
-               throw NSError(domain: "No segments found in playlist", code: -1)
+           if firstVariantSegmentCount.value == 0 {
+               throw NSError(domain: "No segments found in first variant", code: -1)
            }
 
            // Phase 5: Launch download workers
@@ -260,12 +260,12 @@ class HighPerformanceHlsDownloader {
 
                // Progress monitor
                group.addTask {
-                   await self.handleProgressUpdates(
+                   await self.handleProgressUpdatesFirstVariant(
                        progressSubject: progressSubject,
-                       task: task,  // ✅ no inout
+                       task: task,
                        totalDownloadedBytes: totalDownloadedBytes,
                        downloadedSegments: downloadedSegments,
-                       totalSegments: totalSegments,
+                       firstVariantSegmentCount: firstVariantSegmentCount,
                        onProgress: onProgress
                    )
                }
@@ -278,15 +278,17 @@ class HighPerformanceHlsDownloader {
                    )
                }
 
-               // Completion checker
+               // Completion checker - Complete after first variant is downloaded
                group.addTask {
-                   while downloadedSegments.value < totalSegments.value {
+                   while downloadedSegments.value < firstVariantSegmentCount.value {
                        try? await Task.sleep(nanoseconds: 500_000_000)
-                       print("Progress: \(downloadedSegments.value)/\(totalSegments.value) segments downloaded")
+                       print("Progress: \(downloadedSegments.value)/\(firstVariantSegmentCount.value) segments downloaded (first variant only)")
                    }
 
+                   print("First variant download completed!")
                    isCompleted.setValue(true)
 
+                   // Send termination signals to all workers
                    for _ in 0..<currentConfig.concurrentDownloaders {
                        segmentQueue.offer(PrioritySegmentTask(
                            segment: SegmentTask(url: "", fileName: ""),
@@ -297,7 +299,7 @@ class HighPerformanceHlsDownloader {
                }
            }
 
-           // Phase 9: Final playlist creation
+           // Phase 9: Final playlist creation (only for first variant)
            try createMasterPlaylist(variants: Array(variants.prefix(1)), playlistDir: playlistDir)
 
            // Update final state
@@ -314,6 +316,7 @@ class HighPerformanceHlsDownloader {
            throw error
        }
    }
+
 
 
     // MARK: - Helper Methods
@@ -610,13 +613,59 @@ class HighPerformanceHlsDownloader {
         return contentLength
     }
 
+    private func processFirstVariantPlaylist(
+        variants: [VariantPlaylist],
+        baseUri: URL,
+        headers: [String: String],
+        segmentQueue: ThreadSafePriorityQueue<PrioritySegmentTask>,
+        firstVariantSegmentCount: AtomicInt,
+        playlistDir: URL
+    ) async throws {
+
+        guard let firstVariant = variants.first else {
+            throw NSError(domain: "No variants found", code: -1)
+        }
+
+        do {
+            print("Processing first variant: \(firstVariant.url)")
+            let variantContent = try await fetchPlaylistContent(url: firstVariant.url, headers: headers)
+            print("Variant content length: \(variantContent.count)")
+
+            guard let variantUri = URL(string: firstVariant.url) else {
+                throw NSError(domain: "Invalid variant URL", code: -1)
+            }
+
+            let segments = parseVariantPlaylist(content: variantContent, baseUri: variantUri, variantName: firstVariant.fileName)
+            print("Found \(segments.count) segments in first variant")
+
+            firstVariantSegmentCount.setValue(segments.count)
+
+            // Create prioritized tasks for first variant only
+            for (index, segment) in segments.enumerated() {
+                let priority = calculateSegmentPriority(index: index, totalSegments: segments.count, variantIndex: 0)
+                let priorityTask = PrioritySegmentTask(segment: segment, priority: priority, segmentIndex: index)
+                segmentQueue.offer(priorityTask)
+            }
+
+            // Create local playlist for first variant
+            try await Task.detached {
+                try self.createLocalPlaylist(variant: firstVariant, segments: segments, playlistDir: playlistDir)
+            }.value
+
+        } catch {
+            print("Error processing first variant \(firstVariant.url): \(error.localizedDescription)")
+            throw error
+        }
+    }
+
+    // Modified progress handler for first variant only
     @available(iOS 15.0, *)
-    private func handleProgressUpdates(
+    private func handleProgressUpdatesFirstVariant(
         progressSubject: PassthroughSubject<ProgressUpdate, Never>,
         task: MTDownloadTask,
         totalDownloadedBytes: AtomicInt64,
         downloadedSegments: AtomicInt,
-        totalSegments: AtomicInt,
+        firstVariantSegmentCount: AtomicInt,
         onProgress: @escaping ([String: Any]) -> Void
     ) async {
 
@@ -626,21 +675,21 @@ class HighPerformanceHlsDownloader {
         for await _ in progressSubject.values {
             let now = Date().timeIntervalSince1970
 
-            if now - lastUpdate >= updateInterval || downloadedSegments.value >= totalSegments.value {
+            if now - lastUpdate >= updateInterval || downloadedSegments.value >= firstVariantSegmentCount.value {
                 task.downloadedBytes = totalDownloadedBytes.value
 
-                // Estimate total size if not known
+                // Estimate total size based on first variant only
                 if task.totalBytes <= 0 && downloadedSegments.value > 0 {
                     let avgBytesPerSegment = totalDownloadedBytes.value / Int64(downloadedSegments.value)
-                    task.totalBytes = avgBytesPerSegment * Int64(totalSegments.value)
+                    task.totalBytes = avgBytesPerSegment * Int64(firstVariantSegmentCount.value)
                 }
 
                 sendProgress(task: task, onProgress: onProgress)
                 lastUpdate = now
             }
 
-            // Break if all segments downloaded
-            if downloadedSegments.value >= totalSegments.value && totalSegments.value > 0 {
+            // Break if all segments of first variant are downloaded
+            if downloadedSegments.value >= firstVariantSegmentCount.value && firstVariantSegmentCount.value > 0 {
                 break
             }
         }
