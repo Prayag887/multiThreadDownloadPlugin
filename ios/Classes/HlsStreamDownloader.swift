@@ -399,7 +399,9 @@ class HighPerformanceHlsDownloader {
                            downloadedSegments: downloadedSegments,
                            progressSubject: progressSubject,
                            semaphore: semaphore,
-                           isCompleted: isCompleted
+                           isCompleted: isCompleted,
+                           task: task,
+                           onProgress: onProgress
                        )
                    }
                }
@@ -560,7 +562,9 @@ class HighPerformanceHlsDownloader {
         downloadedSegments: AsyncAtomicInt,
         progressSubject: PassthroughSubject<ProgressUpdate, Never>,
         semaphore: DispatchSemaphore,
-        isCompleted: AsyncAtomicBool
+        isCompleted: AsyncAtomicBool,
+        task: MTDownloadTask,
+        onProgress: @escaping ([String: Any]) -> Void
     ) async {
 
         while await !isCompleted.value {
@@ -620,7 +624,7 @@ class HighPerformanceHlsDownloader {
         }
 
         print("Worker \(workerId): Exiting")
-        sendCompletionStatus(task: &task, onProgress: onProgress)
+        sendCompletionStatus(task: task, onProgress: onProgress)
     }
 
     private func downloadSegmentAdvanced(
@@ -1139,7 +1143,7 @@ class HighPerformanceHlsDownloader {
         ])
     }
 
-    private func sendCompletionStatus(task: inout MTDownloadTask, onProgress: @escaping ([String: Any]) -> Void) {
+    private func sendCompletionStatus(task: MTDownloadTask, onProgress: @escaping ([String: Any]) -> Void) {
             // Set completion status
             task.status = .completed
             // Update final progress to 100%
