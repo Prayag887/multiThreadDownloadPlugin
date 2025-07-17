@@ -179,6 +179,7 @@ class HighPerformanceHlsDownloader {
             }
         }
         println("Worker $workerId: Exiting")
+        sendCompletionStatus(&task, onProgress)
     }
 
     /**
@@ -765,6 +766,48 @@ class HighPerformanceHlsDownloader {
             "estimatedTimeRemaining" to estimatedTimeRemaining
         ))
     }
+
+    private func sendCompletionStatus(task: inout MTDownloadTask, onProgress: @escaping ([String: Any]) -> Void) {
+        task.status = .completed
+        // Update final progress to 100%
+        let currentTime = Date().timeIntervalSince1970
+        let timeElapsed = max(1.0, currentTime - task.startTime)
+        let finalSpeed = Double(task.downloadedBytes) * 1000.0 / timeElapsed
+
+        // Update speed history
+        task.speedHistory.append(finalSpeed)
+        if task.speedHistory.count > 10 {
+            task.speedHistory.removeFirst()
+        }
+
+        let avgSpeed = task.speedHistory.isEmpty ? finalSpeed : task.speedHistory.reduce(0, +) / Double(task.speedHistory.count)
+
+        // Force progress to 100%
+        let progress = 100
+
+        print(" HLS Download COMPLETED!")
+        print(" URL: \(task.url)")
+        print("Progress: \(progress)%")
+        print("Status: \(task.status.rawValue) (should be 2)")
+        print(" Downloaded: \(task.downloadedBytes) bytes")
+        print(" Speed: \(avgSpeed) bytes/sec")
+
+        // Send final completion progress
+        onProgress([
+            "url": task.url,
+            "filePath": task.filePath,
+            "progress": progress,
+            "bytesDownloaded": task.downloadedBytes,
+            "totalBytes": task.totalBytes,
+            "status": task.status.rawValue,
+            "error": task.error ?? "",
+            "speed": avgSpeed,
+            "estimatedTimeRemaining": 0
+        ])
+
+        print("Completion status sent to Flutter")
+    }
+}
 
     // Cleanup method
     fun cleanup() {
