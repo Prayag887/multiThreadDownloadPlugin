@@ -433,10 +433,13 @@ class HighPerformanceHlsDownloader {
                        try? await Task.sleep(nanoseconds: 500_000_000)
                        let current = await downloadedSegments.value
                        print("Progress: \(current)/\(targetCount) segments downloaded (first variant only)")
+                       if(current == targetCount){
+                           await isCompleted.setValue(true)
+                           sendProgress(task: task, onProgress: onProgress)
+                       }
                    }
 
                    print("First variant download completed!")
-                   await isCompleted.setValue(true)
 
                    // Send termination signals to all workers
                    for _ in 0..<currentConfig.concurrentDownloaders {
@@ -624,7 +627,7 @@ class HighPerformanceHlsDownloader {
         }
 
         print("Worker \(workerId): Exiting")
-        sendCompletionStatus(task: task, onProgress: onProgress)
+//        sendCompletionStatus(task: task, onProgress: onProgress)
     }
 
     private func downloadSegmentAdvanced(
@@ -1141,49 +1144,49 @@ class HighPerformanceHlsDownloader {
             "speed": avgSpeed,
             "estimatedTimeRemaining": estimatedTimeRemaining
         ])
+
+        print("status sent: \(task.status)")
     }
 
-    private func sendCompletionStatus(task: MTDownloadTask, onProgress: @escaping ([String: Any]) -> Void) {
-            // Set completion status
-            task.status = .completed
-            // Update final progress to 100%
-            let currentTime = Date().timeIntervalSince1970
-            let timeElapsed = max(1.0, currentTime - task.startTime)
-            let finalSpeed = Double(task.downloadedBytes) * 1000.0 / timeElapsed
-
-            // Update speed history
-            task.speedHistory.append(finalSpeed)
-            if task.speedHistory.count > 10 {
-                task.speedHistory.removeFirst()
-            }
-
-            let avgSpeed = task.speedHistory.isEmpty ? finalSpeed : task.speedHistory.reduce(0, +) / Double(task.speedHistory.count)
-
-            // Force progress to 100%
-            let progress = 100
-
-            print(" HLS Download COMPLETED!")
-            print(" URL: \(task.url)")
-            print("Progress: \(progress)%")
-            print("Status: \(task.status.rawValue) (should be 2)")
-            print(" Downloaded: \(task.downloadedBytes) bytes")
-            print(" Speed: \(avgSpeed) bytes/sec")
-
-            // Send final completion progress
-            onProgress([
-                "url": task.url,
-                "filePath": task.filePath,
-                "progress": progress,
-                "bytesDownloaded": task.downloadedBytes,
-                "totalBytes": task.totalBytes,
-                "status": task.status.rawValue,
-                "error": task.error ?? "",
-                "speed": avgSpeed,
-                "estimatedTimeRemaining": 0
-            ])
-
-            print("Completion status sent to Flutter")
-        }
+//    private func sendCompletionStatus(task: MTDownloadTask, onProgress: @escaping ([String: Any]) -> Void) {
+//            // Update final progress to 100%
+//            let currentTime = Date().timeIntervalSince1970
+//            let timeElapsed = max(1.0, currentTime - task.startTime)
+//            let finalSpeed = Double(task.downloadedBytes) * 1000.0 / timeElapsed
+//
+//            // Update speed history
+//            task.speedHistory.append(finalSpeed)
+//            if task.speedHistory.count > 10 {
+//                task.speedHistory.removeFirst()
+//            }
+//
+//            let avgSpeed = task.speedHistory.isEmpty ? finalSpeed : task.speedHistory.reduce(0, +) / Double(task.speedHistory.count)
+//
+//            // Force progress to 100%
+//            let progress = 100
+//
+//            print(" HLS Download COMPLETED!")
+//            print(" URL: \(task.url)")
+//            print("Progress: \(progress)%")
+//            print("Status: \(task.status.rawValue) (should be 2)")
+//            print(" Downloaded: \(task.downloadedBytes) bytes")
+//            print(" Speed: \(avgSpeed) bytes/sec")
+//
+//            // Send final completion progress
+//            onProgress([
+//                "url": task.url,
+//                "filePath": task.filePath,
+//                "progress": progress,
+//                "bytesDownloaded": task.downloadedBytes,
+//                "totalBytes": task.totalBytes,
+//                "status": task.status.rawValue,
+//                "error": task.error ?? "",
+//                "speed": avgSpeed,
+//                "estimatedTimeRemaining": 0
+//            ])
+//
+//            print("Completion status sent to Flutter")
+//        }
 
     // MARK: - Cleanup
 

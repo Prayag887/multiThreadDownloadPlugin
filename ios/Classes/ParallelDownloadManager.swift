@@ -531,7 +531,10 @@ actor ParallelDownloadManager {
     }
 
     func cancelAllDownloads() -> Bool {
-        batchTask?.cancel()
+        if let task = batchTask {
+                batchTask = nil
+                task.cancel()
+            }
 
         batchQueue.removeAll()
         currentBatchIndex = 0
