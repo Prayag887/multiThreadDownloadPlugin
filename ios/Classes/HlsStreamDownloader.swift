@@ -297,7 +297,7 @@ actor ConfigActor {
 
 // MARK: - Main HLS Downloader Class
 
-@available(iOS 13.0, *)
+@available(iOS 15.0, *)
 class HighPerformanceHlsDownloader {
 
     // MARK: - Properties
@@ -433,13 +433,16 @@ class HighPerformanceHlsDownloader {
                        try? await Task.sleep(nanoseconds: 500_000_000)
                        let current = await downloadedSegments.value
                        print("Progress: \(current)/\(targetCount) segments downloaded (first variant only)")
-                       if(current == targetCount){
-                           await isCompleted.setValue(true)
-                           sendProgress(task: task, onProgress: onProgress)
-                       }
+//                       if(current == targetCount){
+//                           await isCompleted.setValue(true)
+//                           sendProgress(task: task, onProgress: onProgress)
+//                       }
                    }
 
+                   await isCompleted.setValue(true)
                    print("First variant download completed!")
+
+                   ParallelDownloadManager.sendProgress(task: task, onProgress: onProgress)
 
                    // Send termination signals to all workers
                    for _ in 0..<currentConfig.concurrentDownloaders {
@@ -459,13 +462,13 @@ class HighPerformanceHlsDownloader {
            task.status = .completed
            task.downloadedBytes = await totalDownloadedBytes.value
            task.filePath = playlistDir.appendingPathComponent("master.m3u8").path
-           sendProgress(task: task, onProgress: onProgress)
+           ParallelDownloadManager.sendProgress(task: task, onProgress: onProgress)
 
        } catch {
            await isCompleted.setValue(true)
            task.status = .failed
            task.error = error.localizedDescription
-           sendProgress(task: task, onProgress: onProgress)
+           ParallelDownloadManager.sendProgress(task: task, onProgress: onProgress)
            throw error
        }
    }
@@ -570,6 +573,10 @@ class HighPerformanceHlsDownloader {
         onProgress: @escaping ([String: Any]) -> Void
     ) async {
 
+        // Static variables inside the function to track worker exits
+        let exitedWorkersCount = AtomicInt(0)
+        let totalWorkers = 15 // or pass as parameter: config.concurrentDownloaders
+
         while await !isCompleted.value {
             // Poll for work with timeout
             guard let priorityTask = await segmentQueue.pollWithTimeout(timeout: 1.0) else {
@@ -601,6 +608,7 @@ class HighPerformanceHlsDownloader {
                 )
                 let downloadTime = Date().timeIntervalSince1970 - startTime
 
+                // Add bytes and increment counter ONLY after successful download
                 await totalDownloadedBytes.add(bytesDownloaded)
                 await downloadedSegments.increment()
 
@@ -610,6 +618,10 @@ class HighPerformanceHlsDownloader {
                     success: true
                 ))
 
+                // Send progress update after actual completion
+            
+                ParallelDownloadManager.sendProgress(task: task, onProgress: onProgress)
+
             } catch {
                 if priorityTask.retryCount < 3 {
                     priorityTask.retryCount += 1
@@ -618,8 +630,15 @@ class HighPerformanceHlsDownloader {
                     await segmentQueue.offer(priorityTask)
                 } else {
                     priorityTask.failed = true
-                    progressSubject.send(ProgressUpdate(bytesDownloaded: 0, downloadTime: 0, success: false))
+                    progressSubject.send(ProgressUpdate(
+                        bytesDownloaded: 0,
+                        downloadTime: 0,
+                        success: false
+                    ))
                     print("Worker \(workerId): Failed to download \(priorityTask.segment.fileName) after retries: \(error.localizedDescription)")
+
+                    // Send progress update on permanent failure
+                    ParallelDownloadManager.sendProgress(task: task, onProgress: onProgress)
                 }
             }
 
@@ -627,7 +646,24 @@ class HighPerformanceHlsDownloader {
         }
 
         print("Worker \(workerId): Exiting")
-//        sendCompletionStatus(task: task, onProgress: onProgress)
+
+        // Internal loop logic: Increment and check if all workers have exited
+        exitedWorkersCount.increment()
+        let currentExited = exitedWorkersCount.value
+
+        print("Workers exited: \(currentExited)/\(totalWorkers)")
+
+        // Check if all workers have exited
+        if currentExited >= totalWorkers {
+            print("All \(totalWorkers) workers have exited. Sending final progress update...")
+
+            // Send final progress update
+            ParallelDownloadManager.sendProgress(task: task, onProgress: onProgress)
+
+            // Reset counter to 0 for next batch/download
+            exitedWorkersCount.setValue(0)
+            print("Worker exit counter reset to 0 for next batch")
+        }
     }
 
     private func downloadSegmentAdvanced(
@@ -840,7 +876,7 @@ class HighPerformanceHlsDownloader {
                     task.totalBytes = avgBytesPerSegment * Int64(totalCount)
                 }
 
-                sendProgress(task: task, onProgress: onProgress)
+                ParallelDownloadManager.sendProgress(task: task, onProgress: onProgress)
                 lastUpdate = now
             }
 
@@ -1116,77 +1152,37 @@ class HighPerformanceHlsDownloader {
         try masterContent.write(to: masterFile, atomically: true, encoding: .utf8)
     }
 
-    private func sendProgress(task: MTDownloadTask, onProgress: ([String: Any]) -> Void) {
-        let currentTime = Date().timeIntervalSince1970
-        let timeElapsed = max(1.0, currentTime - task.startTime)
-        let currentSpeed = Double(task.downloadedBytes) * 1000.0 / timeElapsed
-
-        task.speedHistory.append(currentSpeed)
-        if task.speedHistory.count > 10 {
-            task.speedHistory.removeFirst()
-        }
-
-        let avgSpeed = task.speedHistory.isEmpty ? currentSpeed : task.speedHistory.reduce(0, +) / Double(task.speedHistory.count)
-
-        let progress = task.totalBytes > 0 ? Int((Double(task.downloadedBytes) * 100.0 / Double(task.totalBytes))) : -1
-
-        let remainingBytes = task.totalBytes - task.downloadedBytes
-        let estimatedTimeRemaining = avgSpeed > 0 && remainingBytes > 0 ? Int64(Double(remainingBytes) / avgSpeed * 1000) : -1
-
-        onProgress([
-            "url": task.url,
-            "filePath": task.filePath,
-            "progress": progress,
-            "bytesDownloaded": task.downloadedBytes,
-            "totalBytes": task.totalBytes,
-            "status": task.status.rawValue,
-            "error": task.error ?? "",
-            "speed": avgSpeed,
-            "estimatedTimeRemaining": estimatedTimeRemaining
-        ])
-
-        print("status sent: \(task.status)")
-    }
-
-//    private func sendCompletionStatus(task: MTDownloadTask, onProgress: @escaping ([String: Any]) -> Void) {
-//            // Update final progress to 100%
-//            let currentTime = Date().timeIntervalSince1970
-//            let timeElapsed = max(1.0, currentTime - task.startTime)
-//            let finalSpeed = Double(task.downloadedBytes) * 1000.0 / timeElapsed
+//    private func sendProgress(task: MTDownloadTask, onProgress: ([String: Any]) -> Void) {
+//        let currentTime = Date().timeIntervalSince1970
+//        let timeElapsed = max(1.0, currentTime - task.startTime)
+//        let currentSpeed = Double(task.downloadedBytes) * 1000.0 / timeElapsed
 //
-//            // Update speed history
-//            task.speedHistory.append(finalSpeed)
-//            if task.speedHistory.count > 10 {
-//                task.speedHistory.removeFirst()
-//            }
-//
-//            let avgSpeed = task.speedHistory.isEmpty ? finalSpeed : task.speedHistory.reduce(0, +) / Double(task.speedHistory.count)
-//
-//            // Force progress to 100%
-//            let progress = 100
-//
-//            print(" HLS Download COMPLETED!")
-//            print(" URL: \(task.url)")
-//            print("Progress: \(progress)%")
-//            print("Status: \(task.status.rawValue) (should be 2)")
-//            print(" Downloaded: \(task.downloadedBytes) bytes")
-//            print(" Speed: \(avgSpeed) bytes/sec")
-//
-//            // Send final completion progress
-//            onProgress([
-//                "url": task.url,
-//                "filePath": task.filePath,
-//                "progress": progress,
-//                "bytesDownloaded": task.downloadedBytes,
-//                "totalBytes": task.totalBytes,
-//                "status": task.status.rawValue,
-//                "error": task.error ?? "",
-//                "speed": avgSpeed,
-//                "estimatedTimeRemaining": 0
-//            ])
-//
-//            print("Completion status sent to Flutter")
+//        task.speedHistory.append(currentSpeed)
+//        if task.speedHistory.count > 10 {
+//            task.speedHistory.removeFirst()
 //        }
+//
+//        let avgSpeed = task.speedHistory.isEmpty ? currentSpeed : task.speedHistory.reduce(0, +) / Double(task.speedHistory.count)
+//
+//        let progress = task.totalBytes > 0 ? Int((Double(task.downloadedBytes) * 100.0 / Double(task.totalBytes))) : -1
+//
+//        let remainingBytes = task.totalBytes - task.downloadedBytes
+//        let estimatedTimeRemaining = avgSpeed > 0 && remainingBytes > 0 ? Int64(Double(remainingBytes) / avgSpeed * 1000) : -1
+//
+//        onProgress([
+//            "url": task.url,
+//            "filePath": task.filePath,
+//            "progress": progress,
+//            "bytesDownloaded": task.downloadedBytes,
+//            "totalBytes": task.totalBytes,
+//            "status": task.status.rawValue,
+//            "error": task.error ?? "",
+//            "speed": avgSpeed,
+//            "estimatedTimeRemaining": estimatedTimeRemaining
+//        ])
+//
+//        print("status sent: \(task.status)")
+//    }
 
     // MARK: - Cleanup
 

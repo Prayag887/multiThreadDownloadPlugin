@@ -123,7 +123,7 @@ class HttpsDownloader {
         }
     }
 
-    private func sendProgress(task: MTDownloadTask, onProgress: ([String: Any]) -> Void) {
+    func sendProgress(task: MTDownloadTask, onProgress: ([String: Any]) -> Void) {
         let currentTime = Date().timeIntervalSince1970 * 1000
         let timeElapsed = max(1.0, currentTime - task.startTime)
 
@@ -152,12 +152,12 @@ class HttpsDownloader {
 // MARK: - Parallel Download Manager
 @available(iOS 15.0, *)
 actor ParallelDownloadManager {
-    
+
     private var downloads: [String: MTDownloadTask] = [:]
     private var batchQueue: [[String]] = [] // Queue for batches
     private var currentBatchIndex = 0
     private var isProcessingBatch = false
-    
+
     private var batchTask: Task<Void, Never>?
 
     // Current batch settings
@@ -403,7 +403,7 @@ actor ParallelDownloadManager {
         downloads[url]?.status = .failed
         downloads[url]?.error = error.localizedDescription
         if let updatedTask = downloads[url] {
-            sendProgress(task: updatedTask, onProgress: onProgress)
+            ParallelDownloadManager.sendProgress(task: updatedTask, onProgress: onProgress)
         }
     }
 
@@ -664,7 +664,7 @@ actor ParallelDownloadManager {
         }
     }
 
-    private func sendProgress(task: MTDownloadTask, onProgress: ([String: Any]) -> Void) {
+    static func sendProgress(task: MTDownloadTask, onProgress: ([String: Any]) -> Void) {
         let currentTime = Date().timeIntervalSince1970 * 1000
         let timeElapsed = max(1.0, currentTime - task.startTime)
 
@@ -677,16 +677,35 @@ actor ParallelDownloadManager {
 
         let progress = task.totalBytes > 0 ? Int(Double(task.downloadedBytes) * 100.0 / Double(task.totalBytes)) : -1
 
-        onProgress([
-            "url": task.url,
-            "filePath": task.filePath,
-            "progress": progress,
-            "bytesDownloaded": task.downloadedBytes,
-            "totalBytes": task.totalBytes,
-            "status": task.status.rawValue,
-            "error": task.error ?? "",
-            "speed": avgSpeed
-        ])
+        // Check if download is actually complete (handle edge cases where progress shows 97-99%)
+        let isComplete = (task.downloadedBytes >= task.totalBytes) ||
+        (task.status == .completed || task.status == .pending) ||
+                         (progress >= 97 && task.downloadedBytes > 0 && task.totalBytes > 0)
+
+//        let status = isComplete ? MTDownloadStatus.completed.rawValue : task.status.rawValue
+
+
+        if progress < 50 || isComplete {
+            print("PROGRESS HAS BEEN SENT: \(progress)")
+
+            // Set status to complete and progress to 100 if download is actually complete
+            let finalProgress = isComplete ? 100 : progress
+//            let status = isComplete
+
+            onProgress([
+                "url": task.url,
+                "filePath": task.filePath,
+                "progress": finalProgress,
+                "bytesDownloaded": task.downloadedBytes,
+                "totalBytes": task.totalBytes,
+                "status": task.status.rawValue,
+                "error": task.error ?? "",
+                "speed": avgSpeed
+            ])
+        } else {
+            print("Downlaading ...")
+        }
+        print("=====================")
     }
 
     private func sendBatchProgress(onProgress: ([String: Any]) -> Void) {
