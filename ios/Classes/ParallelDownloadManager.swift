@@ -5,125 +5,159 @@ import Foundation
 class HttpsDownloader {
 
     func downloadSingleFile(task: MTDownloadTask, onProgress: @escaping ([String: Any]) -> Void) async throws {
-        guard let url = URL(string: task.url) else {
-            throw URLError(.badURL)
-        }
-
-        // Create the full file path
-        let fileURL = URL(fileURLWithPath: task.filePath).appendingPathComponent(task.fileName)
-
-        // Check if file partially exists for resume
-        var startByte: Int64 = 0
-        if FileManager.default.fileExists(atPath: fileURL.path) {
-            let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
-            startByte = attributes[.size] as? Int64 ?? 0
-            task.downloadedBytes = startByte
-        }
-
-        // Configure URL request
-        var request = URLRequest(url: url)
-        request.timeoutInterval = TimeInterval(task.timeoutSeconds)
-
-        // Add headers
-        for (key, value) in task.headers {
-            request.setValue(value, forHTTPHeaderField: key)
-        }
-
-        // Add range header for resume
-        if startByte > 0 {
-            request.setValue("bytes=\(startByte)-", forHTTPHeaderField: "Range")
-        }
-
-        task.status = .downloading
-        let startTime = Date().timeIntervalSince1970 * 1000
-
-        do {
-            let (asyncBytes, response) = try await URLSession.shared.bytes(for: request)
-
-            // Get content length
-            if let httpResponse = response as? HTTPURLResponse {
-                let contentLength = httpResponse.expectedContentLength
-                if contentLength > 0 {
-                    task.totalBytes = startByte + contentLength
-                } else if let contentLengthHeader = httpResponse.value(forHTTPHeaderField: "Content-Length"),
-                          let length = Int64(contentLengthHeader) {
-                    task.totalBytes = startByte + length
-                }
+            guard let url = URL(string: task.url) else {
+                throw URLError(.badURL)
             }
 
-            // Create or open file for writing
-            let fileHandle: FileHandle
+            // Create the full file path
+            let fileURL = URL(fileURLWithPath: task.filePath).appendingPathComponent(task.fileName)
+
+            // Check if file partially exists for resume
+            var startByte: Int64 = 0
+            if FileManager.default.fileExists(atPath: fileURL.path) {
+                let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+                startByte = attributes[.size] as? Int64 ?? 0
+                task.downloadedBytes = startByte
+            }
+
+            // Configure URL request
+            var request = URLRequest(url: url)
+            request.timeoutInterval = TimeInterval(task.timeoutSeconds)
+
+            // Add headers
+            for (key, value) in task.headers {
+                request.setValue(value, forHTTPHeaderField: key)
+            }
+
+            // Add range header for resume
             if startByte > 0 {
-                fileHandle = try FileHandle(forWritingTo: fileURL)
-                try fileHandle.seek(toOffset: UInt64(startByte))
-            } else {
-                FileManager.default.createFile(atPath: fileURL.path, contents: nil, attributes: nil)
-                fileHandle = try FileHandle(forWritingTo: fileURL)
+                request.setValue("bytes=\(startByte)-", forHTTPHeaderField: "Range")
             }
 
-            defer {
-                try? fileHandle.close()
-            }
+            task.status = .downloading
+            let startTime = Date().timeIntervalSince1970 * 1000
 
-            var lastProgressTime = startTime
-            let progressInterval: Double = 100 // Update every 100ms
+            // Create atomic variables for thread-safe access
+            let downloadedBytes = AtomicInt64(startByte)
+            let isCompleted = AtomicBool(false)
 
-            // Download data
-            var buffer = Data()
-            for try await byte in asyncBytes {
-                try Task.checkCancellation()
+            do {
+                let (asyncBytes, response) = try await URLSession.shared.bytes(for: request)
 
-                buffer.append(byte)
-                task.downloadedBytes += 1
+                // Get content length
+                if let httpResponse = response as? HTTPURLResponse {
+                    let contentLength = httpResponse.expectedContentLength
+                    if contentLength > 0 {
+                        task.totalBytes = startByte + contentLength
+                    } else if let contentLengthHeader = httpResponse.value(forHTTPHeaderField: "Content-Length"),
+                              let length = Int64(contentLengthHeader) {
+                        task.totalBytes = startByte + length
+                    }
+                }
 
-                // Write buffer when it reaches a certain size (e.g., 8KB)
-                if buffer.count >= 8192 {
+                // Create or open file for writing
+                let fileHandle: FileHandle
+                if startByte > 0 {
+                    fileHandle = try FileHandle(forWritingTo: fileURL)
+                    try fileHandle.seek(toOffset: UInt64(startByte))
+                } else {
+                    FileManager.default.createFile(atPath: fileURL.path, contents: nil, attributes: nil)
+                    fileHandle = try FileHandle(forWritingTo: fileURL)
+                }
+
+                defer {
+                    try? fileHandle.close()
+                }
+
+                // Start progress timer task that runs every second
+                let progressTimer = Task {
+                    while !isCompleted.value && task.status == .downloading {
+                        // Update task with current bytes
+                        task.downloadedBytes = downloadedBytes.value
+
+                        // Update speed history and send progress
+                        let currentTime = Date().timeIntervalSince1970 * 1000
+                        updateSpeedHistory(task: task, currentTime: currentTime)
+                        sendProgress(task: task, onProgress: onProgress)
+
+                        print("Progress timer: \(task.downloadedBytes) bytes downloaded")
+
+                        // Wait for 1 second
+                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    }
+                }
+
+                var lastProgressTime = startTime
+                let quickUpdateInterval: Double = 100 // Quick updates every 100ms during activity
+
+                // Download data
+                var buffer = Data()
+                for try await byte in asyncBytes {
+                    try Task.checkCancellation()
+
+                    buffer.append(byte)
+                    downloadedBytes.add(1)
+
+                    // Write buffer when it reaches a certain size (e.g., 8KB)
+                    if buffer.count >= 8192 {
+                        try fileHandle.write(contentsOf: buffer)
+                        buffer.removeAll()
+                    }
+
+                    // Update progress periodically for responsiveness during active downloading
+                    let currentTime = Date().timeIntervalSince1970 * 1000
+                    if currentTime - lastProgressTime >= quickUpdateInterval {
+                        task.downloadedBytes = downloadedBytes.value
+                        updateSpeedHistory(task: task, currentTime: currentTime)
+                        sendProgress(task: task, onProgress: onProgress)
+                        lastProgressTime = currentTime
+                    }
+                }
+
+                // Write any remaining data in buffer
+                if !buffer.isEmpty {
                     try fileHandle.write(contentsOf: buffer)
-                    buffer.removeAll()
                 }
 
-                // Update progress periodically
-                let currentTime = Date().timeIntervalSince1970 * 1000
-                if currentTime - lastProgressTime >= progressInterval {
-                    updateSpeedHistory(task: task, currentTime: currentTime)
-                    sendProgress(task: task, onProgress: onProgress)
-                    lastProgressTime = currentTime
+                // Mark as completed and cancel timer
+                isCompleted.setValue(true)
+                progressTimer.cancel()
+
+                // Final update
+                task.downloadedBytes = downloadedBytes.value
+                task.status = .completed
+                sendProgress(task: task, onProgress: onProgress)
+
+            } catch {
+                // Mark as completed and cancel timer
+                isCompleted.setValue(true)
+
+                if error is CancellationError {
+                    task.status = .cancelled
+                } else {
+                    task.status = .failed
+                    task.error = error.localizedDescription
                 }
-            }
 
-            // Write any remaining data in buffer
-            if !buffer.isEmpty {
-                try fileHandle.write(contentsOf: buffer)
+                task.downloadedBytes = downloadedBytes.value
+                sendProgress(task: task, onProgress: onProgress)
+                throw error
             }
-
-            task.status = .completed
-            sendProgress(task: task, onProgress: onProgress)
-
-        } catch {
-            if error is CancellationError {
-                task.status = .cancelled
-            } else {
-                task.status = .failed
-                task.error = error.localizedDescription
-            }
-            sendProgress(task: task, onProgress: onProgress)
-            throw error
         }
-    }
 
     private func updateSpeedHistory(task: MTDownloadTask, currentTime: Double) {
-        let timeElapsed = max(1.0, currentTime - task.startTime)
-        let currentSpeed = Double(task.downloadedBytes) * 1000.0 / timeElapsed
+         let timeElapsed = max(1.0, currentTime - task.startTime)
+         let currentSpeed = Double(task.downloadedBytes) * 1000.0 / timeElapsed
 
-        task.speedHistory.append(currentSpeed)
+         task.speedHistory.append(currentSpeed)
 
-        // Keep only last 10 speed measurements
-        if task.speedHistory.count > 10 {
-            task.speedHistory.removeFirst()
-        }
-    }
+         // Keep only last 10 speed measurements
+         if task.speedHistory.count > 10 {
+             task.speedHistory.removeFirst()
+         }
+     }
 
-    private func sendProgress(task: MTDownloadTask, onProgress: ([String: Any]) -> Void) {
+private func sendProgress(task: MTDownloadTask, onProgress: ([String: Any]) -> Void) {
         let currentTime = Date().timeIntervalSince1970 * 1000
         let timeElapsed = max(1.0, currentTime - task.startTime)
 
