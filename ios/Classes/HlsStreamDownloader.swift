@@ -284,6 +284,7 @@ class HighPerformanceHlsDownloader {
                        try? await Task.sleep(nanoseconds: 500_000_000)
                        print("Progress: \(downloadedSegments.value)/\(totalSegments.value) segments downloaded")
                        if(downloadedSegments.value == totalSegments.value) {
+                           task.status = .completed
                            ParallelDownloadManager.sendProgress(task: task,  onProgress: onProgress)
                        }
                    }
