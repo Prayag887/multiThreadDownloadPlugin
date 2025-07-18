@@ -149,7 +149,7 @@ class HttpsDownloader {
     }
 }
 
-// MARK: - Parallel Download Manager
+// MARK: - Enhanced Parallel Download Manager with HLS Queue Support
 @available(iOS 15.0, *)
 actor ParallelDownloadManager {
 
@@ -173,9 +173,98 @@ actor ParallelDownloadManager {
     private var onAllBatchesComplete: (() -> Void)?
 
     private let httpsDownloader = HttpsDownloader()
+
+    // ✅ ADD: HLS Queue Manager Integration
+    private let hlsQueueManager = QueuedHlsDownloadManager()
+
+    // ✅ CHANGE: Use the fixed HLS downloader
     private let hlsDownloader = HighPerformanceHlsDownloader()
 
-    // MARK: - Public Methods
+    // MARK: - ✅ NEW: HLS Queue Management Methods
+
+    /// Queue HLS downloads for sequential processing
+    func queueHlsDownloads(
+        urls: [String],
+        basePath: String,
+        headers: [String: String] = [:],
+        onProgress: @escaping ([String: Any]) -> Void,
+        priority: Int = 0
+    ) async -> [String] {
+
+        var queueIds: [String] = []
+
+        for url in urls {
+            guard url.lowercased().hasSuffix(".m3u8") else {
+                print("⚠️ Skipping non-HLS URL: \(url)")
+                continue
+            }
+
+            let fileName = extractFileName(url: url)
+            let task = MTDownloadTask(
+                url: url,
+                filePath: basePath,
+                fileName: fileName,
+                headers: headers
+            )
+
+            let queueId = await hlsQueueManager.queueDownload(
+                task: task,
+                basePath: basePath,
+                onProgress: onProgress,
+                priority: priority
+            )
+
+            queueIds.append(queueId)
+            downloads[url] = task
+        }
+
+        return queueIds
+    }
+
+    /// Queue single HLS download
+    func queueSingleHlsDownload(
+        url: String,
+        basePath: String,
+        headers: [String: String] = [:],
+        onProgress: @escaping ([String: Any]) -> Void,
+        priority: Int = 0
+    ) async -> String? {
+
+        guard url.lowercased().hasSuffix(".m3u8") else {
+            print("⚠️ URL is not an HLS stream: \(url)")
+            return nil
+        }
+
+        let queueIds = await queueHlsDownloads(
+            urls: [url],
+            basePath: basePath,
+            headers: headers,
+            onProgress: onProgress,
+            priority: priority
+        )
+
+        return queueIds.first
+    }
+
+    /// Get HLS queue status
+    func getHlsQueueStatus() async -> [String: Any] {
+        return await hlsQueueManager.getQueueStatus()
+    }
+
+    /// Control HLS queue
+    func pauseHlsQueue() async {
+        await hlsQueueManager.pauseQueue()
+    }
+
+    func resumeHlsQueue() async {
+        await hlsQueueManager.resumeQueue()
+    }
+
+    func cancelHlsQueue() async {
+        await hlsQueueManager.cancelQueue()
+    }
+
+    // MARK: - Existing Methods (Keep all as-is, just minor fix)
 
     /// Queue multiple batches for sequential processing
     func queueBatches(
@@ -239,11 +328,10 @@ actor ParallelDownloadManager {
         }
     }
 
-    // MARK: - Private Batch Processing
+    // MARK: - Private Batch Processing (Keep all existing methods exactly as-is)
 
     private func startNextBatch() async {
         guard currentBatchIndex < batchQueue.count else {
-            // All batches completed
             await handleAllBatchesComplete()
             return
         }
@@ -251,15 +339,12 @@ actor ParallelDownloadManager {
         let urls = batchQueue[currentBatchIndex]
         isProcessingBatch = true
 
-        // Clear previous downloads if ready for new batch
         if await isReadyForNewBatch() {
             await clearCompletedDownloads()
         }
 
-        // Set up tasks for current batch
         await setupBatchTasks(urls: urls)
 
-        // Start batch processing
         batchTask = Task {
             await processBatch(urls: urls)
         }
@@ -269,7 +354,6 @@ actor ParallelDownloadManager {
         for url in urls {
             let fileName = extractFileName(url: url)
 
-            // Clean and turn it into a folder name
             let folderName = fileName
                 .replacingOccurrences(of: ".m3u8", with: "")
                 .replacingOccurrences(of: "/", with: "_")
@@ -277,10 +361,8 @@ actor ParallelDownloadManager {
             let safeFolderName = folderName.isEmpty ? "download" : folderName
             let downloadDir = URL(fileURLWithPath: currentBasePath).appendingPathComponent(safeFolderName).path
 
-            // Ensure the directory exists
             try? FileManager.default.createDirectory(atPath: downloadDir, withIntermediateDirectories: true, attributes: nil)
 
-            // Set up the task
             let task = MTDownloadTask(
                 url: url,
                 filePath: downloadDir,
@@ -298,11 +380,9 @@ actor ParallelDownloadManager {
     private func processBatch(urls: [String]) async {
         guard let onProgress = currentOnProgress else { return }
 
-        // Create semaphore for concurrent task control
         let taskSemaphore = DispatchSemaphore(value: currentMaxConcurrentTasks)
         var task: MTDownloadTask?
 
-        // Map urls to async tasks
         await withTaskGroup(of: Void.self) { group in
             for url in urls {
                 group.addTask { [weak self] in
@@ -311,7 +391,6 @@ actor ParallelDownloadManager {
                         continuation.resume()
                     }
 
-                    // Get task from downloads map
                     guard let self = self,
                           let originalTask = await self.getDownloadTask(for: url) else {
                         taskSemaphore.signal()
@@ -321,7 +400,6 @@ actor ParallelDownloadManager {
                     task = originalTask
 
                     do {
-
                         if task!.url.lowercased().hasSuffix(".m3u8") {
                             try await self.hlsDownloader.downloadHlsStreamAdvanced(
                                 task: task!,
@@ -335,11 +413,9 @@ actor ParallelDownloadManager {
                             )
                         }
 
-                        // Save updated task state
                         await self.updateDownloadTask(url: url, task: task!)
 
                     } catch {
-                        // Handle task failure
                         await self.handleTaskFailure(url: url, error: error, onProgress: onProgress)
                     }
 
@@ -348,51 +424,45 @@ actor ParallelDownloadManager {
             }
         }
 
-        // Send final batch progress
         await sendBatchProgress(onProgress: onProgress)
-        await ParallelDownloadManager.sendProgress(task: task!, onProgress: onProgress)
+        if let task = task {
+            await ParallelDownloadManager.sendProgress(task: task, onProgress: onProgress)
+        }
 
-        // Handle batch completion
         await handleBatchComplete()
     }
+
+    // MARK: - Keep All Other Existing Methods As-Is
 
     private func handleBatchComplete() async {
         isProcessingBatch = false
         currentBatchIndex += 1
 
-        // Send batch completion status
         if let onProgress = currentOnProgress {
             await sendBatchCompletionStatus(onProgress: onProgress)
         }
 
-        // Call batch completion callback
         onBatchComplete?()
 
-        // Start next batch after a short delay
         Task {
-            try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
-            await self.startNextBatch() // Fixed: removed task parameter
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            await self.startNextBatch()
         }
     }
 
     private func handleAllBatchesComplete() async {
         isProcessingBatch = false
 
-        // Send all batches completion status
         if let onProgress = currentOnProgress {
             await sendAllBatchesCompletionStatus(onProgress: onProgress)
         }
 
-        // Call all batches completion callback
         onAllBatchesComplete?()
 
-        // Clean up
         onBatchComplete = nil
         onAllBatchesComplete = nil
         currentOnProgress = nil
     }
-
-    // MARK: - Helper Methods for Actor Safety
 
     private func getDownloadTask(for url: String) -> MTDownloadTask? {
         return downloads[url]
@@ -414,7 +484,7 @@ actor ParallelDownloadManager {
         return currentBasePath
     }
 
-    // MARK: - Status Methods
+    // MARK: - All Other Status and Control Methods (Keep exactly as-is)
 
     func isBatchComplete() -> Bool {
         if downloads.isEmpty { return true }
@@ -462,8 +532,6 @@ actor ParallelDownloadManager {
             "overallProgress": totalBatches > 0 ? Int(Double(currentIndex) * 100.0 / Double(totalBatches)) : 100
         ]
     }
-
-    // MARK: - Control Methods
 
     func pauseDownload(url: String) -> Bool {
         guard let task = downloads[url] else { return false }
@@ -535,9 +603,9 @@ actor ParallelDownloadManager {
 
     func cancelAllDownloads() -> Bool {
         if let task = batchTask {
-                batchTask = nil
-                task.cancel()
-            }
+            batchTask = nil
+            task.cancel()
+        }
 
         batchQueue.removeAll()
         currentBatchIndex = 0
@@ -555,8 +623,6 @@ actor ParallelDownloadManager {
 
         return true
     }
-
-    // MARK: - Progress and Status Methods
 
     func getDownloadStatus(url: String) -> [String: Any]? {
         guard let task = downloads[url] else { return nil }
@@ -606,7 +672,6 @@ actor ParallelDownloadManager {
             averageSpeed = 0.0
         }
 
-        // Add batch queue info
         let batchStatus = getAllBatchesStatus()
 
         return [
@@ -647,8 +712,6 @@ actor ParallelDownloadManager {
         return true
     }
 
-    // MARK: - Private Helper Methods
-
     private func extractFileName(url: String) -> String {
         if let uri = URL(string: url) {
             let path = uri.path
@@ -680,20 +743,14 @@ actor ParallelDownloadManager {
 
         let progress = task.totalBytes > 0 ? Int(Double(task.downloadedBytes) * 100.0 / Double(task.totalBytes)) : -1
 
-        // Check if download is actually complete (handle edge cases where progress shows 97-99%)
         let isComplete = (task.downloadedBytes >= task.totalBytes) ||
         (task.status == .completed || task.status == .pending) ||
                          (progress >= 97 && task.downloadedBytes > 0 && task.totalBytes > 0)
 
-//        let status = isComplete ? MTDownloadStatus.completed.rawValue : task.status.rawValue
-
-
         if progress < 50 || isComplete {
             print("PROGRESS HAS BEEN SENT: \(progress)")
 
-            // Set status to complete and progress to 100 if download is actually complete
             let finalProgress = isComplete ? 100 : progress
-//            let status = isComplete
 
             onProgress([
                 "url": task.url,
@@ -706,7 +763,7 @@ actor ParallelDownloadManager {
                 "speed": avgSpeed
             ])
         } else {
-            print("Downlaading ...")
+            print("Downloading ...")
         }
         print("=====================")
     }

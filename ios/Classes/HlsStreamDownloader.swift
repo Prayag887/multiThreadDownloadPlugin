@@ -1,14 +1,7 @@
 import Foundation
 import Combine
 
-// MARK: - Key Fixes Applied:
-// 1. Fixed completion detection in downloadWorker
-// 2. Added proper final progress sending
-// 3. Fixed worker termination logic
-// 4. Added completion state management
-// 5. Fixed progress monitoring termination
-
-// MARK: - Data Models (unchanged, keeping for completeness)
+// MARK: - Enhanced Data Models
 
 struct PerformanceMetrics {
     var avgDownloadSpeed: Double = 0.0
@@ -121,20 +114,64 @@ struct ProgressUpdate {
     let success: Bool
 }
 
+// MARK: - Queue Management Models
+
+struct HlsDownloadRequest {
+    let id: String
+    let task: MTDownloadTask
+    let basePath: String
+    let onProgress: ([String: Any]) -> Void
+    let priority: Int
+    let createdAt: TimeInterval
+
+    init(task: MTDownloadTask, basePath: String, onProgress: @escaping ([String: Any]) -> Void, priority: Int = 0) {
+        self.id = UUID().uuidString
+        self.task = task
+        self.basePath = basePath
+        self.onProgress = onProgress
+        self.priority = priority
+        self.createdAt = Date().timeIntervalSince1970
+    }
+}
+
+extension HlsDownloadRequest: Comparable {
+    static func < (lhs: HlsDownloadRequest, rhs: HlsDownloadRequest) -> Bool {
+        if lhs.priority != rhs.priority {
+            return lhs.priority > rhs.priority // Higher priority first
+        }
+        return lhs.createdAt < rhs.createdAt // Earlier requests first for same priority
+    }
+
+    static func == (lhs: HlsDownloadRequest, rhs: HlsDownloadRequest) -> Bool {
+        return lhs.id == rhs.id
+    }
+}
+
+enum QueueStatus {
+    case idle
+    case processing
+    case paused
+    case cancelled
+}
+
 // MARK: - Async-Safe Thread-Safe Collections
 
 @available(iOS 13.0, *)
 actor AsyncPriorityQueue<T: Comparable> {
     private var heap: [T] = []
     private var waitingTasks: [CheckedContinuation<T?, Never>] = []
-    private var isCompleted: Bool = false // ✅ Added completion state
+    private var isCompleted: Bool = false
 
     var isEmpty: Bool {
         heap.isEmpty
     }
 
+    var count: Int {
+        heap.count
+    }
+
     func offer(_ element: T) {
-        guard !isCompleted else { return } // ✅ Don't accept new items if completed
+        guard !isCompleted else { return }
 
         heap.append(element)
         heap.sort()
@@ -156,7 +193,7 @@ actor AsyncPriorityQueue<T: Comparable> {
         }
 
         if isCompleted {
-            return nil // ✅ Return nil if completed
+            return nil
         }
 
         return await withCheckedContinuation { continuation in
@@ -170,7 +207,7 @@ actor AsyncPriorityQueue<T: Comparable> {
         }
 
         if isCompleted {
-            return nil // ✅ Return nil if completed
+            return nil
         }
 
         return await withTaskGroup(of: T?.self) { group in
@@ -198,10 +235,18 @@ actor AsyncPriorityQueue<T: Comparable> {
         }
     }
 
-    // ✅ Added method to mark queue as completed
     func markCompleted() {
         isCompleted = true
         // Resume all waiting tasks with nil
+        for continuation in waitingTasks {
+            continuation.resume(returning: nil)
+        }
+        waitingTasks.removeAll()
+    }
+
+    func reset() {
+        isCompleted = false
+        heap.removeAll()
         for continuation in waitingTasks {
             continuation.resume(returning: nil)
         }
@@ -317,7 +362,206 @@ actor ConfigActor {
     }
 }
 
-// MARK: - Main HLS Downloader Class
+// MARK: - Queued HLS Download Manager
+
+@available(iOS 15.0, *)
+actor QueuedHlsDownloadManager {
+
+    // MARK: - Properties
+
+    private let hlsDownloader = HighPerformanceHlsDownloader()
+    private let downloadQueue = AsyncPriorityQueue<HlsDownloadRequest>()
+    private var queueStatus: QueueStatus = .idle
+    private var currentDownload: HlsDownloadRequest?
+    private var queueProcessor: Task<Void, Never>?
+    private var isProcessing: Bool = false
+
+    // Queue statistics
+    private var totalQueued: Int = 0
+    private var totalCompleted: Int = 0
+    private var totalFailed: Int = 0
+
+    // MARK: - Public Queue Management Methods
+
+    func queueDownload(
+        task: MTDownloadTask,
+        basePath: String,
+        onProgress: @escaping ([String: Any]) -> Void,
+        priority: Int = 0
+    ) async -> String {
+
+        let request = HlsDownloadRequest(
+            task: task,
+            basePath: basePath,
+            onProgress: onProgress,
+            priority: priority
+        )
+
+        await downloadQueue.offer(request)
+        totalQueued += 1
+
+        print("📥 Queued HLS download: \(task.fileName) (ID: \(request.id), Priority: \(priority))")
+        print("📊 Queue stats - Queued: \(totalQueued), Completed: \(totalCompleted), Failed: \(totalFailed)")
+
+        // Start queue processor if not running
+        if !isProcessing {
+            await startQueueProcessor()
+        }
+
+        return request.id
+    }
+
+    func getQueueStatus() -> [String: Any] {
+        return [
+            "status": queueStatus,
+            "isProcessing": isProcessing,
+            "queueLength": downloadQueue.count,
+            "totalQueued": totalQueued,
+            "totalCompleted": totalCompleted,
+            "totalFailed": totalFailed,
+            "currentDownload": currentDownload?.task.fileName ?? "None"
+        ]
+    }
+
+    func pauseQueue() {
+        queueStatus = .paused
+        queueProcessor?.cancel()
+        print("⏸️ Queue paused")
+    }
+
+    func resumeQueue() async {
+        if queueStatus == .paused {
+            queueStatus = .idle
+            await startQueueProcessor()
+            print("▶️ Queue resumed")
+        }
+    }
+
+    func cancelQueue() {
+        queueStatus = .cancelled
+        queueProcessor?.cancel()
+        currentDownload?.task.status = .cancelled
+
+        // Clear the queue
+        Task {
+            await downloadQueue.markCompleted()
+            await downloadQueue.reset()
+        }
+
+        print("❌ Queue cancelled and cleared")
+    }
+
+    func clearCompletedFromQueue() {
+        // This would require tracking completed downloads separately
+        // For now, we just reset statistics
+        totalCompleted = 0
+        totalFailed = 0
+        print("🧹 Cleared completed download statistics")
+    }
+
+    // MARK: - Private Queue Processing
+
+    private func startQueueProcessor() async {
+        guard !isProcessing && queueStatus != .cancelled else { return }
+
+        isProcessing = true
+        queueStatus = .processing
+
+        queueProcessor = Task { [weak self] in
+            await self?.processQueue()
+        }
+
+        print("🚀 Queue processor started")
+    }
+
+    private func processQueue() async {
+        while queueStatus != .cancelled && queueStatus != .paused {
+            // Check if queue is empty
+            if await downloadQueue.isEmpty {
+                print("📭 Queue is empty, waiting for new downloads...")
+                queueStatus = .idle
+                isProcessing = false
+                return
+            }
+
+            // Get next download from queue
+            guard let downloadRequest = await downloadQueue.poll() else {
+                continue
+            }
+
+            currentDownload = downloadRequest
+            print("🔄 Processing download: \(downloadRequest.task.fileName) (ID: \(downloadRequest.id))")
+
+            // Send queue status update
+            sendQueueProgressUpdate(request: downloadRequest)
+
+            do {
+                // Download the HLS stream
+                try await hlsDownloader.downloadHlsStreamAdvanced(
+                    task: downloadRequest.task,
+                    basePath: downloadRequest.basePath,
+                    onProgress: { progress in
+                        // Enhance progress with queue information
+                        var enhancedProgress = progress
+                        enhancedProgress["queueId"] = downloadRequest.id
+                        enhancedProgress["queuePosition"] = 0 // Currently processing
+                        enhancedProgress["queueLength"] = self.downloadQueue.count
+                        downloadRequest.onProgress(enhancedProgress)
+                    }
+                )
+
+                // Success
+                totalCompleted += 1
+                print("✅ Completed download: \(downloadRequest.task.fileName)")
+
+            } catch {
+                // Failure
+                totalFailed += 1
+                downloadRequest.task.status = .failed
+                downloadRequest.task.error = error.localizedDescription
+                print("❌ Failed download: \(downloadRequest.task.fileName) - \(error.localizedDescription)")
+
+                // Send final error progress
+                downloadRequest.onProgress([
+                    "url": downloadRequest.task.url,
+                    "filePath": downloadRequest.task.filePath,
+                    "progress": 0,
+                    "status": downloadRequest.task.status.rawValue,
+                    "error": downloadRequest.task.error ?? "",
+                    "queueId": downloadRequest.id
+                ])
+            }
+
+            currentDownload = nil
+
+            // Brief pause between downloads
+            try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 seconds
+        }
+
+        isProcessing = false
+        print("🛑 Queue processor stopped")
+    }
+
+    private func sendQueueProgressUpdate(request: HlsDownloadRequest) {
+        let queueProgress: [String: Any] = [
+            "queueStatus": [
+                "status": queueStatus,
+                "isProcessing": isProcessing,
+                "queueLength": downloadQueue.count,
+                "totalQueued": totalQueued,
+                "totalCompleted": totalCompleted,
+                "totalFailed": totalFailed,
+                "currentDownload": request.task.fileName,
+                "currentDownloadId": request.id
+            ],
+            "isQueueUpdate": true
+        ]
+
+        request.onProgress(queueProgress)
+    }
+}
+
+// MARK: - Enhanced HLS Downloader (Same as before but with queue integration)
 
 @available(iOS 15.0, *)
 class HighPerformanceHlsDownloader {
@@ -341,7 +585,7 @@ class HighPerformanceHlsDownloader {
         self.session = URLSession(configuration: configuration)
     }
 
-    // MARK: - Main Download Function (✅ FIXED)
+    // MARK: - Main Download Function
 
    @available(iOS 15.0, *)
    func downloadHlsStreamAdvanced(
@@ -450,7 +694,7 @@ class HighPerformanceHlsDownloader {
                    )
                }
 
-               // ✅ FIXED Completion checker
+               // Completion checker
                group.addTask {
                    let targetCount = await firstVariantSegmentCount.value
                    print("Waiting for \(targetCount) segments to complete...")
@@ -461,13 +705,13 @@ class HighPerformanceHlsDownloader {
                        print("Progress: \(current)/\(targetCount) segments downloaded")
                    }
 
-                   // ✅ Mark completion immediately when all segments are done
+                   // Mark completion immediately when all segments are done
                    await isCompleted.setValue(true)
-                   await segmentQueue.markCompleted() // ✅ Mark queue as completed
+                   await segmentQueue.markCompleted()
 
                    print("✅ All segments downloaded! Marking as completed...")
 
-                   // ✅ Send final progress update
+                   // Send final progress update
                    task.status = .completed
                    task.downloadedBytes = await totalDownloadedBytes.value
                    ParallelDownloadManager.sendProgress(task: task, onProgress: onProgress)
@@ -479,7 +723,7 @@ class HighPerformanceHlsDownloader {
            // Phase 9: Final playlist creation (only for first variant)
            try createMasterPlaylist(variants: Array(variants.prefix(1)), playlistDir: playlistDir)
 
-           // ✅ Ensure final state is set
+           // Ensure final state is set
            if task.status != .completed {
                task.status = .completed
                task.downloadedBytes = await totalDownloadedBytes.value
@@ -496,7 +740,7 @@ class HighPerformanceHlsDownloader {
        }
    }
 
-    // MARK: - Helper Methods
+    // MARK: - Helper Methods (All the existing helper methods remain the same)
 
     private func analyzeHlsStream(
         masterUrl: String,
@@ -556,7 +800,6 @@ class HighPerformanceHlsDownloader {
         }
     }
 
-    // ✅ FIXED Download Worker - Proper termination logic
     private func downloadWorker(
         workerId: Int,
         segmentQueue: AsyncPriorityQueue<PrioritySegmentTask>,
@@ -575,18 +818,15 @@ class HighPerformanceHlsDownloader {
         print("Worker \(workerId): Started")
 
         while await !isCompleted.value {
-            // ✅ Poll for work with timeout, will return nil when queue is marked complete
             guard let priorityTask = await segmentQueue.pollWithTimeout(timeout: 1.0) else {
-                // ✅ Check completion status before continuing or breaking
                 if await isCompleted.value {
                     break
                 } else {
-                    try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
+                    try? await Task.sleep(nanoseconds: 100_000_000)
                     continue
                 }
             }
 
-            // ✅ Check for termination signal
             if priorityTask.priority == -1 {
                 print("Worker \(workerId): Received termination signal")
                 break
@@ -607,7 +847,6 @@ class HighPerformanceHlsDownloader {
                 )
                 let downloadTime = Date().timeIntervalSince1970 - startTime
 
-                // Add bytes and increment counter ONLY after successful download
                 await totalDownloadedBytes.add(bytesDownloaded)
                 await downloadedSegments.increment()
 
@@ -642,7 +881,6 @@ class HighPerformanceHlsDownloader {
         print("Worker \(workerId): Exiting")
     }
 
-    // ✅ FIXED Progress Handler - Proper termination
     @available(iOS 15.0, *)
     private func handleProgressUpdatesFirstVariant(
         progressSubject: PassthroughSubject<ProgressUpdate, Never>,
@@ -655,10 +893,9 @@ class HighPerformanceHlsDownloader {
     ) async {
 
         var lastUpdate: TimeInterval = 0
-        let updateInterval: TimeInterval = 0.3 // 300ms
+        let updateInterval: TimeInterval = 0.3
 
         for await progressUpdate in progressSubject.values {
-            // ✅ Check if completed before processing
             if await isCompleted.value {
                 print("Progress handler: Detected completion, breaking...")
                 break
@@ -671,7 +908,6 @@ class HighPerformanceHlsDownloader {
             if now - lastUpdate >= updateInterval {
                 task.downloadedBytes = await totalDownloadedBytes.value
 
-                // Estimate total size based on first variant only
                 if task.totalBytes <= 0 && downloadedCount > 0 {
                     let avgBytesPerSegment = task.downloadedBytes / Int64(downloadedCount)
                     task.totalBytes = avgBytesPerSegment * Int64(totalCount)
@@ -681,7 +917,6 @@ class HighPerformanceHlsDownloader {
                 lastUpdate = now
             }
 
-            // ✅ Check if all segments are downloaded
             if downloadedCount >= totalCount && totalCount > 0 {
                 print("Progress handler: All segments completed (\(downloadedCount)/\(totalCount))")
                 break
@@ -691,7 +926,6 @@ class HighPerformanceHlsDownloader {
         print("Progress handler: Exiting")
     }
 
-    // ✅ FIXED Performance Monitor - Proper termination
     private func monitorPerformance(
         totalDownloadedBytes: AsyncAtomicInt64,
         startTime: TimeInterval,
@@ -699,7 +933,7 @@ class HighPerformanceHlsDownloader {
     ) async {
 
         while await !isCompleted.value {
-            try? await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
 
             let currentTime = Date().timeIntervalSince1970
             let timeElapsed = currentTime - startTime
@@ -712,7 +946,7 @@ class HighPerformanceHlsDownloader {
         print("Performance monitor: Exiting")
     }
 
-    // MARK: - Remaining methods unchanged...
+    // MARK: - Download Methods
 
     private func downloadSegmentAdvanced(
         segment: SegmentTask,
@@ -785,7 +1019,6 @@ class HighPerformanceHlsDownloader {
         config: AdaptiveConfig
     ) async throws -> Int64 {
 
-        // Get content length
         guard let contentLength = try await getContentLength(url: segment.url, headers: headers) else {
             return try await downloadSegmentStreaming(
                 segment: segment,
@@ -806,13 +1039,11 @@ class HighPerformanceHlsDownloader {
 
         let chunks = Int((contentLength + Int64(config.chunkSize) - 1) / Int64(config.chunkSize))
 
-        // Create file with proper size
         FileManager.default.createFile(atPath: segmentFile.path, contents: Data(count: Int(contentLength)))
 
         let fileHandle = try FileHandle(forWritingTo: segmentFile)
         defer { fileHandle.closeFile() }
 
-        // Download chunks in parallel
         try await withThrowingTaskGroup(of: (Int, Data).self) { group in
             for chunkIndex in 0..<chunks {
                 group.addTask {
@@ -840,7 +1071,6 @@ class HighPerformanceHlsDownloader {
                 }
             }
 
-            // Write chunks in order
             for try await (chunkIndex, data) in group {
                 let offset = Int64(chunkIndex) * Int64(config.chunkSize)
                 fileHandle.seek(toFileOffset: UInt64(offset))
@@ -856,22 +1086,21 @@ class HighPerformanceHlsDownloader {
     private func calculateSegmentPriority(index: Int, totalSegments: Int, variantIndex: Int) -> Int {
         let basePriority: Int
 
-        // Calculate bounds and ensure they're valid
         let earlyBound = max(5, Int(Double(totalSegments) * 0.1))
         let mediumBound = max(earlyBound, Int(Double(totalSegments) * 0.3))
 
         switch index {
         case 0..<5:
-            basePriority = 100 - index // Highest priority for first segments
+            basePriority = 100 - index
         case 5..<earlyBound:
-            basePriority = 80 - index // High priority for early segments
+            basePriority = 80 - index
         case earlyBound..<mediumBound:
-            basePriority = 60 // Medium priority
+            basePriority = 60
         default:
-            basePriority = 40 // Normal priority
+            basePriority = 40
         }
 
-        return basePriority - (variantIndex * 10) // Prefer higher quality variants
+        return basePriority - (variantIndex * 10)
     }
 
     private func getContentLength(url: String, headers: [String: String]) async throws -> Int64? {
@@ -902,7 +1131,6 @@ class HighPerformanceHlsDownloader {
             throw NSError(domain: "Invalid URL format: \(url)", code: -1001)
         }
 
-        // Check if this is actually an HLS URL
         guard url.lowercased().contains(".m3u8") else {
             throw NSError(domain: "Not an HLS playlist URL: \(url)", code: -1002)
         }
@@ -911,7 +1139,6 @@ class HighPerformanceHlsDownloader {
         request.timeoutInterval = 30
         request.cachePolicy = .reloadIgnoringLocalCacheData
 
-        // Set User-Agent to avoid blocking
         request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
 
         for (key, value) in headers {
@@ -940,7 +1167,6 @@ class HighPerformanceHlsDownloader {
             throw NSError(domain: "Empty playlist content", code: -1006)
         }
 
-        // Validate that it's actually an M3U8 playlist
         guard content.contains("#EXTM3U") else {
             throw NSError(domain: "Invalid M3U8 format: Content does not contain #EXTM3U", code: -1007)
         }
@@ -950,14 +1176,11 @@ class HighPerformanceHlsDownloader {
     }
 
     private func resolveURL(_ urlString: String, baseUri: URL) -> String {
-        // Handle absolute URLs
         if urlString.hasPrefix("http://") || urlString.hasPrefix("https://") {
             return urlString
         }
 
-        // Handle relative URLs
         if urlString.hasPrefix("/") {
-            // Root-relative URL
             guard let scheme = baseUri.scheme, let host = baseUri.host else {
                 return baseUri.appendingPathComponent(urlString).absoluteString
             }
@@ -968,7 +1191,6 @@ class HighPerformanceHlsDownloader {
             components.path = urlString
             return components.url?.absoluteString ?? baseUri.appendingPathComponent(urlString).absoluteString
         } else {
-            // Path-relative URL - resolve against directory of base URL
             let baseDirectory = baseUri.deletingLastPathComponent()
             return baseDirectory.appendingPathComponent(urlString).absoluteString
         }
@@ -984,7 +1206,6 @@ class HighPerformanceHlsDownloader {
             let line = lines[i].trimmingCharacters(in: .whitespaces)
 
             if line.hasPrefix("#EXT-X-STREAM-INF:") {
-                // Extract bandwidth with regex
                 let bandwidthPattern = "BANDWIDTH=(\\d+)"
                 if let regex = try? NSRegularExpression(pattern: bandwidthPattern),
                    let match = regex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) {
@@ -992,7 +1213,6 @@ class HighPerformanceHlsDownloader {
                     currentBandwidth = Int64(String(line[bandwidthRange])) ?? 0
                 }
 
-                // Extract resolution with regex
                 let resolutionPattern = "RESOLUTION=(\\d+x\\d+)"
                 if let regex = try? NSRegularExpression(pattern: resolutionPattern),
                    let match = regex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) {
@@ -1001,11 +1221,9 @@ class HighPerformanceHlsDownloader {
                 }
 
             } else if !line.isEmpty && !line.hasPrefix("#") {
-                // Resolve the variant URL properly
                 let variantUrl = resolveURL(line, baseUri: baseUri)
                 let variantFileName = URL(string: line)?.lastPathComponent ?? line
 
-                // Validate the variant URL
                 if variantUrl.lowercased().contains(".m3u8") {
                     variants.append(VariantPlaylist(
                         url: variantUrl,
@@ -1018,7 +1236,6 @@ class HighPerformanceHlsDownloader {
                     print("Skipping non-M3U8 variant: \(variantUrl)")
                 }
 
-                // Reset for next variant
                 currentBandwidth = 0
                 currentResolution = ""
             }
@@ -1038,7 +1255,6 @@ class HighPerformanceHlsDownloader {
             let line = lines[i].trimmingCharacters(in: .whitespaces)
 
             if line.hasPrefix("#EXTINF:") {
-                // Enhanced duration parsing
                 let durationPattern = "#EXTINF:([\\d.]+)"
                 if let regex = try? NSRegularExpression(pattern: durationPattern),
                    let match = regex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) {
@@ -1046,7 +1262,6 @@ class HighPerformanceHlsDownloader {
                     segmentDuration = Double(String(line[durationRange])) ?? 10.0
                 }
             } else if !line.isEmpty && !line.hasPrefix("#") {
-                // Resolve segment URL properly
                 let segmentUrl = resolveURL(line, baseUri: baseUri)
                 let originalFileName = URL(string: line)?.lastPathComponent ?? line
                 let segmentFileName = "\(variantName)_\(originalFileName)"
@@ -1099,14 +1314,174 @@ class HighPerformanceHlsDownloader {
         try masterContent.write(to: masterFile, atomically: true, encoding: .utf8)
     }
 
-    // MARK: - Cleanup
-
     func cleanup() {
         session.invalidateAndCancel()
     }
 }
 
-// MARK: - Legacy Atomic Types (for compatibility with existing MTDownloadTask)
+// MARK: - Enhanced ParallelDownloadManager with HLS Queue Integration
+
+@available(iOS 15.0, *)
+actor EnhancedParallelDownloadManager {
+
+    private var downloads: [String: MTDownloadTask] = [:]
+    private let httpsDownloader = HttpsDownloader()
+    private let hlsQueueManager = QueuedHlsDownloadManager()
+
+    // MARK: - HLS Queue Methods
+
+    func queueHlsDownload(
+        task: MTDownloadTask,
+        basePath: String,
+        onProgress: @escaping ([String: Any]) -> Void,
+        priority: Int = 0
+    ) async -> String {
+
+        let queueId = await hlsQueueManager.queueDownload(
+            task: task,
+            basePath: basePath,
+            onProgress: onProgress,
+            priority: priority
+        )
+
+        downloads[task.url] = task
+        return queueId
+    }
+
+    func startSingleDownload(
+        task: MTDownloadTask,
+        basePath: String,
+        onProgress: @escaping ([String: Any]) -> Void
+    ) async throws {
+
+        downloads[task.url] = task
+
+        if task.url.lowercased().hasSuffix(".m3u8") {
+            // Use queue for HLS downloads
+            _ = await hlsQueueManager.queueDownload(
+                task: task,
+                basePath: basePath,
+                onProgress: onProgress,
+                priority: 100 // High priority for single downloads
+            )
+        } else {
+            // Direct download for HTTPS
+            try await httpsDownloader.downloadSingleFile(
+                task: task,
+                onProgress: onProgress
+            )
+        }
+    }
+
+    func getHlsQueueStatus() async -> [String: Any] {
+        return await hlsQueueManager.getQueueStatus()
+    }
+
+    func pauseHlsQueue() async {
+        await hlsQueueManager.pauseQueue()
+    }
+
+    func resumeHlsQueue() async {
+        await hlsQueueManager.resumeQueue()
+    }
+
+    func cancelHlsQueue() async {
+        await hlsQueueManager.cancelQueue()
+    }
+
+    func clearCompletedHlsDownloads() async {
+        await hlsQueueManager.clearCompletedFromQueue()
+    }
+
+    // MARK: - Standard Download Methods
+
+    func getDownloadStatus(url: String) -> [String: Any]? {
+        guard let task = downloads[url] else { return nil }
+
+        let currentTime = Date().timeIntervalSince1970 * 1000
+        let timeElapsed = max(1.0, currentTime - task.startTime)
+        let avgSpeed: Double
+        if !task.speedHistory.isEmpty {
+            avgSpeed = task.speedHistory.reduce(0, +) / Double(task.speedHistory.count)
+        } else {
+            avgSpeed = Double(task.downloadedBytes) * 1000.0 / timeElapsed
+        }
+        let progress = task.totalBytes > 0 ? Int(Double(task.downloadedBytes) * 100.0 / Double(task.totalBytes)) : 0
+
+        return [
+            "url": task.url,
+            "filePath": task.filePath,
+            "progress": progress,
+            "bytesDownloaded": task.downloadedBytes,
+            "totalBytes": task.totalBytes,
+            "status": task.status.rawValue,
+            "error": task.error ?? "",
+            "speed": avgSpeed
+        ]
+    }
+
+    func cancelDownload(url: String) -> Bool {
+        guard let task = downloads[url] else { return false }
+
+        downloads[url]?.status = .cancelled
+        downloads[url]?.job?.cancel()
+        try? FileManager.default.removeItem(atPath: task.filePath)
+        downloads.removeValue(forKey: url)
+        return true
+    }
+
+    func cancelAllDownloads() async -> Bool {
+        await hlsQueueManager.cancelQueue()
+
+        for (_, task) in downloads {
+            task.job?.cancel()
+            try? FileManager.default.removeItem(atPath: task.filePath)
+        }
+        downloads.removeAll()
+
+        return true
+    }
+
+    static func sendProgress(task: MTDownloadTask, onProgress: ([String: Any]) -> Void) {
+        let currentTime = Date().timeIntervalSince1970 * 1000
+        let timeElapsed = max(1.0, currentTime - task.startTime)
+
+        let avgSpeed: Double
+        if !task.speedHistory.isEmpty {
+            avgSpeed = task.speedHistory.reduce(0, +) / Double(task.speedHistory.count)
+        } else {
+            avgSpeed = Double(task.downloadedBytes) * 1000.0 / timeElapsed
+        }
+
+        let progress = task.totalBytes > 0 ? Int(Double(task.downloadedBytes) * 100.0 / Double(task.totalBytes)) : -1
+
+        let isComplete = (task.downloadedBytes >= task.totalBytes) ||
+        (task.status == .completed || task.status == .pending) ||
+                         (progress >= 97 && task.downloadedBytes > 0 && task.totalBytes > 0)
+
+        if progress < 50 || isComplete {
+            print("PROGRESS HAS BEEN SENT: \(progress)")
+
+            let finalProgress = isComplete ? 100 : progress
+
+            onProgress([
+                "url": task.url,
+                "filePath": task.filePath,
+                "progress": finalProgress,
+                "bytesDownloaded": task.downloadedBytes,
+                "totalBytes": task.totalBytes,
+                "status": task.status.rawValue,
+                "error": task.error ?? "",
+                "speed": avgSpeed
+            ])
+        } else {
+            print("Downloading ...")
+        }
+        print("=====================")
+    }
+}
+
+// MARK: - Legacy Atomic Types
 
 class AtomicInt {
     private let queue = DispatchQueue(label: "AtomicInt", attributes: .concurrent)
