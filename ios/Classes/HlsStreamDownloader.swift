@@ -1,7 +1,14 @@
 import Foundation
 import Combine
 
-// MARK: - Data Models
+// MARK: - Key Fixes Applied:
+// 1. Fixed completion detection in downloadWorker
+// 2. Added proper final progress sending
+// 3. Fixed worker termination logic
+// 4. Added completion state management
+// 5. Fixed progress monitoring termination
+
+// MARK: - Data Models (unchanged, keeping for completeness)
 
 struct PerformanceMetrics {
     var avgDownloadSpeed: Double = 0.0
@@ -120,15 +127,18 @@ struct ProgressUpdate {
 actor AsyncPriorityQueue<T: Comparable> {
     private var heap: [T] = []
     private var waitingTasks: [CheckedContinuation<T?, Never>] = []
+    private var isCompleted: Bool = false // ✅ Added completion state
 
     var isEmpty: Bool {
         heap.isEmpty
     }
 
     func offer(_ element: T) {
+        guard !isCompleted else { return } // ✅ Don't accept new items if completed
+
         heap.append(element)
         heap.sort()
-        
+
         // Resume any waiting tasks
         if !waitingTasks.isEmpty {
             let continuation = waitingTasks.removeFirst()
@@ -144,48 +154,60 @@ actor AsyncPriorityQueue<T: Comparable> {
         if !heap.isEmpty {
             return heap.removeFirst()
         }
-        
+
+        if isCompleted {
+            return nil // ✅ Return nil if completed
+        }
+
         return await withCheckedContinuation { continuation in
             waitingTasks.append(continuation)
         }
     }
-    
+
     func pollWithTimeout(timeout: TimeInterval) async -> T? {
         if !heap.isEmpty {
             return heap.removeFirst()
         }
-        
-        // Fix: Use proper actor isolation for timeout polling
+
+        if isCompleted {
+            return nil // ✅ Return nil if completed
+        }
+
         return await withTaskGroup(of: T?.self) { group in
             group.addTask {
                 try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
                 return nil
             }
-            
+
             group.addTask {
-                // Call the regular poll method which properly handles actor isolation
                 return await self.poll()
             }
-            
-            // Get first result
+
             guard let result = await group.next() else {
                 group.cancelAll()
                 return nil
             }
-            
-            // Cancel remaining tasks
+
             group.cancelAll()
-            
-            // If result is nil (timeout), clean up waiting tasks
+
             if result == nil {
                 await self.cleanupWaitingTasks()
             }
-            
+
             return result
         }
     }
-    
-    // Fix: Add isolated method to safely clean up waiting tasks
+
+    // ✅ Added method to mark queue as completed
+    func markCompleted() {
+        isCompleted = true
+        // Resume all waiting tasks with nil
+        for continuation in waitingTasks {
+            continuation.resume(returning: nil)
+        }
+        waitingTasks.removeAll()
+    }
+
     private func cleanupWaitingTasks() async {
         for continuation in waitingTasks {
             continuation.resume(returning: nil)
@@ -264,17 +286,17 @@ actor AsyncAtomicBool {
 @available(iOS 13.0, *)
 actor PerformanceMetricsActor {
     private var metrics = PerformanceMetrics()
-    
+
     func getMetrics() -> PerformanceMetrics {
         metrics
     }
-    
+
     func updateSpeed(_ speed: Double, at time: TimeInterval) {
         metrics.speedHistory.append(speed)
         if metrics.speedHistory.count > 20 {
             metrics.speedHistory.removeFirst()
         }
-        
+
         metrics.avgDownloadSpeed = metrics.speedHistory.reduce(0, +) / Double(metrics.speedHistory.count)
         metrics.lastSpeedUpdate = time
     }
@@ -285,11 +307,11 @@ actor PerformanceMetricsActor {
 @available(iOS 13.0, *)
 actor ConfigActor {
     private var config = AdaptiveConfig()
-    
+
     func getConfig() -> AdaptiveConfig {
         config
     }
-    
+
     func adaptConfig(metrics: PerformanceMetrics, segmentSize: Int64) {
         config.adapt(metrics: metrics, segmentSize: segmentSize)
     }
@@ -319,7 +341,7 @@ class HighPerformanceHlsDownloader {
         self.session = URLSession(configuration: configuration)
     }
 
-    // MARK: - Main Download Function
+    // MARK: - Main Download Function (✅ FIXED)
 
    @available(iOS 15.0, *)
    func downloadHlsStreamAdvanced(
@@ -342,7 +364,7 @@ class HighPerformanceHlsDownloader {
 
        let totalDownloadedBytes = AsyncAtomicInt64(0)
        let downloadedSegments = AsyncAtomicInt(0)
-       let firstVariantSegmentCount = AsyncAtomicInt(0) // Track first variant segment count
+       let firstVariantSegmentCount = AsyncAtomicInt(0)
        let isCompleted = AsyncAtomicBool(false)
 
        do {
@@ -414,7 +436,8 @@ class HighPerformanceHlsDownloader {
                        totalDownloadedBytes: totalDownloadedBytes,
                        downloadedSegments: downloadedSegments,
                        firstVariantSegmentCount: firstVariantSegmentCount,
-                       onProgress: onProgress
+                       onProgress: onProgress,
+                       isCompleted: isCompleted
                    )
                }
 
@@ -422,47 +445,47 @@ class HighPerformanceHlsDownloader {
                group.addTask {
                    await self.monitorPerformance(
                        totalDownloadedBytes: totalDownloadedBytes,
-                       startTime: task.startTime
+                       startTime: task.startTime,
+                       isCompleted: isCompleted
                    )
                }
 
-               // Completion checker - Complete after first variant is downloaded
+               // ✅ FIXED Completion checker
                group.addTask {
                    let targetCount = await firstVariantSegmentCount.value
+                   print("Waiting for \(targetCount) segments to complete...")
+
                    while await downloadedSegments.value < targetCount {
                        try? await Task.sleep(nanoseconds: 500_000_000)
                        let current = await downloadedSegments.value
-                       print("Progress: \(current)/\(targetCount) segments downloaded (first variant only)")
-//                       if(current == targetCount){
-//                           await isCompleted.setValue(true)
-//                           sendProgress(task: task, onProgress: onProgress)
-//                       }
+                       print("Progress: \(current)/\(targetCount) segments downloaded")
                    }
 
+                   // ✅ Mark completion immediately when all segments are done
                    await isCompleted.setValue(true)
-                   print("First variant download completed!")
+                   await segmentQueue.markCompleted() // ✅ Mark queue as completed
 
+                   print("✅ All segments downloaded! Marking as completed...")
+
+                   // ✅ Send final progress update
+                   task.status = .completed
+                   task.downloadedBytes = await totalDownloadedBytes.value
                    ParallelDownloadManager.sendProgress(task: task, onProgress: onProgress)
 
-                   // Send termination signals to all workers
-                   for _ in 0..<currentConfig.concurrentDownloaders {
-                       await segmentQueue.offer(PrioritySegmentTask(
-                           segment: SegmentTask(url: "", fileName: ""),
-                           priority: -1,
-                           segmentIndex: -1
-                       ))
-                   }
+                   print("✅ Final progress sent!")
                }
            }
 
            // Phase 9: Final playlist creation (only for first variant)
            try createMasterPlaylist(variants: Array(variants.prefix(1)), playlistDir: playlistDir)
 
-           // Update final state
-           task.status = .completed
-           task.downloadedBytes = await totalDownloadedBytes.value
-           task.filePath = playlistDir.appendingPathComponent("master.m3u8").path
-           ParallelDownloadManager.sendProgress(task: task, onProgress: onProgress)
+           // ✅ Ensure final state is set
+           if task.status != .completed {
+               task.status = .completed
+               task.downloadedBytes = await totalDownloadedBytes.value
+               task.filePath = playlistDir.appendingPathComponent("master.m3u8").path
+               ParallelDownloadManager.sendProgress(task: task, onProgress: onProgress)
+           }
 
        } catch {
            await isCompleted.setValue(true)
@@ -488,76 +511,52 @@ class HighPerformanceHlsDownloader {
         return (variants, avgSegmentSize)
     }
 
-    private func processVariantPlaylists(
+    private func processFirstVariantPlaylist(
         variants: [VariantPlaylist],
         baseUri: URL,
         headers: [String: String],
         segmentQueue: AsyncPriorityQueue<PrioritySegmentTask>,
-        totalSegments: AsyncAtomicInt,
+        firstVariantSegmentCount: AsyncAtomicInt,
         playlistDir: URL
     ) async throws {
 
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            for (variantIndex, variant) in variants.enumerated() {
-                group.addTask {
-                    try await self.processVariantPlaylist(
-                        variant: variant,
-                        baseUri: baseUri,
-                        headers: headers,
-                        segmentQueue: segmentQueue,
-                        totalSegments: totalSegments,
-                        variantIndex: variantIndex,
-                        playlistDir: playlistDir
-                    )
-                }
-            }
-
-            try await group.waitForAll()
+        guard let firstVariant = variants.first else {
+            throw NSError(domain: "No variants found", code: -1)
         }
-    }
-
-    private func processVariantPlaylist(
-        variant: VariantPlaylist,
-        baseUri: URL,
-        headers: [String: String],
-        segmentQueue: AsyncPriorityQueue<PrioritySegmentTask>,
-        totalSegments: AsyncAtomicInt,
-        variantIndex: Int,
-        playlistDir: URL
-    ) async throws {
 
         do {
-            print("Processing variant: \(variant.url)")
-            let variantContent = try await fetchPlaylistContent(url: variant.url, headers: headers)
+            print("Processing first variant: \(firstVariant.url)")
+            let variantContent = try await fetchPlaylistContent(url: firstVariant.url, headers: headers)
             print("Variant content length: \(variantContent.count)")
 
-            guard let variantUri = URL(string: variant.url) else {
+            guard let variantUri = URL(string: firstVariant.url) else {
                 throw NSError(domain: "Invalid variant URL", code: -1)
             }
 
-            let segments = parseVariantPlaylist(content: variantContent, baseUri: variantUri, variantName: variant.fileName)
-            print("Found \(segments.count) segments in variant")
+            let segments = parseVariantPlaylist(content: variantContent, baseUri: variantUri, variantName: firstVariant.fileName)
+            print("Found \(segments.count) segments in first variant")
 
-            await totalSegments.add(segments.count)
+            await firstVariantSegmentCount.setValue(segments.count)
 
-            // Create prioritized tasks
+            // Create prioritized tasks for first variant only
             for (index, segment) in segments.enumerated() {
-                let priority = calculateSegmentPriority(index: index, totalSegments: segments.count, variantIndex: variantIndex)
+                let priority = calculateSegmentPriority(index: index, totalSegments: segments.count, variantIndex: 0)
                 let priorityTask = PrioritySegmentTask(segment: segment, priority: priority, segmentIndex: index)
                 await segmentQueue.offer(priorityTask)
             }
 
-            // Create local playlist asynchronously
+            // Create local playlist for first variant
             try await Task.detached {
-                try self.createLocalPlaylist(variant: variant, segments: segments, playlistDir: playlistDir)
+                try self.createLocalPlaylist(variant: firstVariant, segments: segments, playlistDir: playlistDir)
             }.value
 
         } catch {
-            print("Error processing variant \(variant.url): \(error.localizedDescription)")
+            print("Error processing first variant \(firstVariant.url): \(error.localizedDescription)")
             throw error
         }
     }
 
+    // ✅ FIXED Download Worker - Proper termination logic
     private func downloadWorker(
         workerId: Int,
         segmentQueue: AsyncPriorityQueue<PrioritySegmentTask>,
@@ -573,23 +572,23 @@ class HighPerformanceHlsDownloader {
         onProgress: @escaping ([String: Any]) -> Void
     ) async {
 
-        // Static variables inside the function to track worker exits
-        let exitedWorkersCount = AtomicInt(0)
-        let totalWorkers = 15 // or pass as parameter: config.concurrentDownloaders
+        print("Worker \(workerId): Started")
 
         while await !isCompleted.value {
-            // Poll for work with timeout
+            // ✅ Poll for work with timeout, will return nil when queue is marked complete
             guard let priorityTask = await segmentQueue.pollWithTimeout(timeout: 1.0) else {
-                if await !isCompleted.value {
+                // ✅ Check completion status before continuing or breaking
+                if await isCompleted.value {
+                    break
+                } else {
                     try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
                     continue
-                } else {
-                    break
                 }
             }
 
-            // Check for termination signal
+            // ✅ Check for termination signal
             if priorityTask.priority == -1 {
+                print("Worker \(workerId): Received termination signal")
                 break
             }
 
@@ -618,9 +617,7 @@ class HighPerformanceHlsDownloader {
                     success: true
                 ))
 
-                // Send progress update after actual completion
-            
-                ParallelDownloadManager.sendProgress(task: task, onProgress: onProgress)
+                print("Worker \(workerId): Downloaded segment \(priorityTask.segmentIndex)")
 
             } catch {
                 if priorityTask.retryCount < 3 {
@@ -636,9 +633,6 @@ class HighPerformanceHlsDownloader {
                         success: false
                     ))
                     print("Worker \(workerId): Failed to download \(priorityTask.segment.fileName) after retries: \(error.localizedDescription)")
-
-                    // Send progress update on permanent failure
-                    ParallelDownloadManager.sendProgress(task: task, onProgress: onProgress)
                 }
             }
 
@@ -646,25 +640,79 @@ class HighPerformanceHlsDownloader {
         }
 
         print("Worker \(workerId): Exiting")
-
-        // Internal loop logic: Increment and check if all workers have exited
-        exitedWorkersCount.increment()
-        let currentExited = exitedWorkersCount.value
-
-        print("Workers exited: \(currentExited)/\(totalWorkers)")
-
-        // Check if all workers have exited
-        if currentExited >= totalWorkers {
-            print("All \(totalWorkers) workers have exited. Sending final progress update...")
-
-            // Send final progress update
-            ParallelDownloadManager.sendProgress(task: task, onProgress: onProgress)
-
-            // Reset counter to 0 for next batch/download
-            exitedWorkersCount.setValue(0)
-            print("Worker exit counter reset to 0 for next batch")
-        }
     }
+
+    // ✅ FIXED Progress Handler - Proper termination
+    @available(iOS 15.0, *)
+    private func handleProgressUpdatesFirstVariant(
+        progressSubject: PassthroughSubject<ProgressUpdate, Never>,
+        task: MTDownloadTask,
+        totalDownloadedBytes: AsyncAtomicInt64,
+        downloadedSegments: AsyncAtomicInt,
+        firstVariantSegmentCount: AsyncAtomicInt,
+        onProgress: @escaping ([String: Any]) -> Void,
+        isCompleted: AsyncAtomicBool
+    ) async {
+
+        var lastUpdate: TimeInterval = 0
+        let updateInterval: TimeInterval = 0.3 // 300ms
+
+        for await progressUpdate in progressSubject.values {
+            // ✅ Check if completed before processing
+            if await isCompleted.value {
+                print("Progress handler: Detected completion, breaking...")
+                break
+            }
+
+            let now = Date().timeIntervalSince1970
+            let downloadedCount = await downloadedSegments.value
+            let totalCount = await firstVariantSegmentCount.value
+
+            if now - lastUpdate >= updateInterval {
+                task.downloadedBytes = await totalDownloadedBytes.value
+
+                // Estimate total size based on first variant only
+                if task.totalBytes <= 0 && downloadedCount > 0 {
+                    let avgBytesPerSegment = task.downloadedBytes / Int64(downloadedCount)
+                    task.totalBytes = avgBytesPerSegment * Int64(totalCount)
+                }
+
+                ParallelDownloadManager.sendProgress(task: task, onProgress: onProgress)
+                lastUpdate = now
+            }
+
+            // ✅ Check if all segments are downloaded
+            if downloadedCount >= totalCount && totalCount > 0 {
+                print("Progress handler: All segments completed (\(downloadedCount)/\(totalCount))")
+                break
+            }
+        }
+
+        print("Progress handler: Exiting")
+    }
+
+    // ✅ FIXED Performance Monitor - Proper termination
+    private func monitorPerformance(
+        totalDownloadedBytes: AsyncAtomicInt64,
+        startTime: TimeInterval,
+        isCompleted: AsyncAtomicBool
+    ) async {
+
+        while await !isCompleted.value {
+            try? await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
+
+            let currentTime = Date().timeIntervalSince1970
+            let timeElapsed = currentTime - startTime
+            let bytesDownloaded = await totalDownloadedBytes.value
+            let currentSpeed = Double(bytesDownloaded) * 1000.0 / timeElapsed
+
+            await metricsActor.updateSpeed(currentSpeed, at: currentTime)
+        }
+
+        print("Performance monitor: Exiting")
+    }
+
+    // MARK: - Remaining methods unchanged...
 
     private func downloadSegmentAdvanced(
         segment: SegmentTask,
@@ -801,107 +849,6 @@ class HighPerformanceHlsDownloader {
         }
 
         return contentLength
-    }
-
-    private func processFirstVariantPlaylist(
-        variants: [VariantPlaylist],
-        baseUri: URL,
-        headers: [String: String],
-        segmentQueue: AsyncPriorityQueue<PrioritySegmentTask>,
-        firstVariantSegmentCount: AsyncAtomicInt,
-        playlistDir: URL
-    ) async throws {
-
-        guard let firstVariant = variants.first else {
-            throw NSError(domain: "No variants found", code: -1)
-        }
-
-        do {
-            print("Processing first variant: \(firstVariant.url)")
-            let variantContent = try await fetchPlaylistContent(url: firstVariant.url, headers: headers)
-            print("Variant content length: \(variantContent.count)")
-
-            guard let variantUri = URL(string: firstVariant.url) else {
-                throw NSError(domain: "Invalid variant URL", code: -1)
-            }
-
-            let segments = parseVariantPlaylist(content: variantContent, baseUri: variantUri, variantName: firstVariant.fileName)
-            print("Found \(segments.count) segments in first variant")
-
-            await firstVariantSegmentCount.setValue(segments.count)
-
-            // Create prioritized tasks for first variant only
-            for (index, segment) in segments.enumerated() {
-                let priority = calculateSegmentPriority(index: index, totalSegments: segments.count, variantIndex: 0)
-                let priorityTask = PrioritySegmentTask(segment: segment, priority: priority, segmentIndex: index)
-                await segmentQueue.offer(priorityTask)
-            }
-
-            // Create local playlist for first variant
-            try await Task.detached {
-                try self.createLocalPlaylist(variant: firstVariant, segments: segments, playlistDir: playlistDir)
-            }.value
-
-        } catch {
-            print("Error processing first variant \(firstVariant.url): \(error.localizedDescription)")
-            throw error
-        }
-    }
-
-    // Modified progress handler for first variant only
-    @available(iOS 15.0, *)
-    private func handleProgressUpdatesFirstVariant(
-        progressSubject: PassthroughSubject<ProgressUpdate, Never>,
-        task: MTDownloadTask,
-        totalDownloadedBytes: AsyncAtomicInt64,
-        downloadedSegments: AsyncAtomicInt,
-        firstVariantSegmentCount: AsyncAtomicInt,
-        onProgress: @escaping ([String: Any]) -> Void
-    ) async {
-
-        var lastUpdate: TimeInterval = 0
-        let updateInterval: TimeInterval = 0.3 // 300ms
-
-        for await _ in progressSubject.values {
-            let now = Date().timeIntervalSince1970
-            let downloadedCount = await downloadedSegments.value
-            let totalCount = await firstVariantSegmentCount.value
-
-            if now - lastUpdate >= updateInterval || downloadedCount >= totalCount {
-                task.downloadedBytes = await totalDownloadedBytes.value
-
-                // Estimate total size based on first variant only
-                if task.totalBytes <= 0 && downloadedCount > 0 {
-                    let avgBytesPerSegment = task.downloadedBytes / Int64(downloadedCount)
-                    task.totalBytes = avgBytesPerSegment * Int64(totalCount)
-                }
-
-                ParallelDownloadManager.sendProgress(task: task, onProgress: onProgress)
-                lastUpdate = now
-            }
-
-            // Break if all segments of first variant are downloaded
-            if downloadedCount >= totalCount && totalCount > 0 {
-                break
-            }
-        }
-    }
-
-    private func monitorPerformance(
-        totalDownloadedBytes: AsyncAtomicInt64,
-        startTime: TimeInterval
-    ) async {
-
-        while true {
-            try? await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
-
-            let currentTime = Date().timeIntervalSince1970
-            let timeElapsed = currentTime - startTime
-            let bytesDownloaded = await totalDownloadedBytes.value
-            let currentSpeed = Double(bytesDownloaded) * 1000.0 / timeElapsed
-
-            await metricsActor.updateSpeed(currentSpeed, at: currentTime)
-        }
     }
 
     // MARK: - Utility Methods
@@ -1151,38 +1098,6 @@ class HighPerformanceHlsDownloader {
         let masterFile = playlistDir.appendingPathComponent("master.m3u8")
         try masterContent.write(to: masterFile, atomically: true, encoding: .utf8)
     }
-
-//    private func sendProgress(task: MTDownloadTask, onProgress: ([String: Any]) -> Void) {
-//        let currentTime = Date().timeIntervalSince1970
-//        let timeElapsed = max(1.0, currentTime - task.startTime)
-//        let currentSpeed = Double(task.downloadedBytes) * 1000.0 / timeElapsed
-//
-//        task.speedHistory.append(currentSpeed)
-//        if task.speedHistory.count > 10 {
-//            task.speedHistory.removeFirst()
-//        }
-//
-//        let avgSpeed = task.speedHistory.isEmpty ? currentSpeed : task.speedHistory.reduce(0, +) / Double(task.speedHistory.count)
-//
-//        let progress = task.totalBytes > 0 ? Int((Double(task.downloadedBytes) * 100.0 / Double(task.totalBytes))) : -1
-//
-//        let remainingBytes = task.totalBytes - task.downloadedBytes
-//        let estimatedTimeRemaining = avgSpeed > 0 && remainingBytes > 0 ? Int64(Double(remainingBytes) / avgSpeed * 1000) : -1
-//
-//        onProgress([
-//            "url": task.url,
-//            "filePath": task.filePath,
-//            "progress": progress,
-//            "bytesDownloaded": task.downloadedBytes,
-//            "totalBytes": task.totalBytes,
-//            "status": task.status.rawValue,
-//            "error": task.error ?? "",
-//            "speed": avgSpeed,
-//            "estimatedTimeRemaining": estimatedTimeRemaining
-//        ])
-//
-//        print("status sent: \(task.status)")
-//    }
 
     // MARK: - Cleanup
 
