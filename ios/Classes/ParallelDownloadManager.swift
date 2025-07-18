@@ -300,6 +300,7 @@ actor ParallelDownloadManager {
 
         // Create semaphore for concurrent task control
         let taskSemaphore = DispatchSemaphore(value: currentMaxConcurrentTasks)
+        var task: MTDownloadTask?
 
         // Map urls to async tasks
         await withTaskGroup(of: Void.self) { group in
@@ -317,24 +318,25 @@ actor ParallelDownloadManager {
                         return
                     }
 
-                    do {
-                        var task = originalTask
+                    task = originalTask
 
-                        if task.url.lowercased().hasSuffix(".m3u8") {
+                    do {
+
+                        if task!.url.lowercased().hasSuffix(".m3u8") {
                             try await self.hlsDownloader.downloadHlsStreamAdvanced(
-                                task: task,
+                                task: task!,
                                 basePath: await self.getCurrentBasePath(),
                                 onProgress: onProgress
                             )
                         } else {
                             try await self.httpsDownloader.downloadSingleFile(
-                                task: task,
+                                task: task!,
                                 onProgress: onProgress
                             )
                         }
 
                         // Save updated task state
-                        await self.updateDownloadTask(url: url, task: task)
+                        await self.updateDownloadTask(url: url, task: task!)
 
                     } catch {
                         // Handle task failure
@@ -348,6 +350,7 @@ actor ParallelDownloadManager {
 
         // Send final batch progress
         await sendBatchProgress(onProgress: onProgress)
+        await ParallelDownloadManager.sendProgress(task: task!, onProgress: onProgress)
 
         // Handle batch completion
         await handleBatchComplete()
@@ -368,7 +371,7 @@ actor ParallelDownloadManager {
         // Start next batch after a short delay
         Task {
             try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
-            await self.startNextBatch()
+            await self.startNextBatch() // Fixed: removed task parameter
         }
     }
 

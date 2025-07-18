@@ -11,6 +11,7 @@ class MultithreadedDownloads {
   static const EventChannel _progressChannel = EventChannel('multithread_downloads/progress');
 
   static Stream<DownloadProgress>? _progressStream;
+  static Stream<BatchDownloadProgress>? _batchProgressStream;
 
   // Keep a reference to your server so you can close it if needed
   HttpServer? _localServer;
@@ -55,6 +56,13 @@ class MultithreadedDownloads {
         .receiveBroadcastStream()
         .map((event) => DownloadProgress.fromMap(Map<String, dynamic>.from(event)));
     return _progressStream!;
+  }
+
+  static Stream<BatchDownloadProgress> get batchProgressStream {
+    _batchProgressStream ??= _progressChannel
+        .receiveBroadcastStream()
+        .map((event) => BatchDownloadProgress.fromMap(Map<String, dynamic>.from(event)));
+    return _batchProgressStream!;
   }
 
   static Future<bool> startDownload({
