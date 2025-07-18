@@ -577,7 +577,7 @@ class ParallelDownloadManager {
         }
     }
 
-    private func sendProgress(task: MTDownloadTask, onProgress: ([String: Any]) -> Void) {
+    static func sendProgress(task: MTDownloadTask, onProgress: ([String: Any]) -> Void) {
         let currentTime = Date().timeIntervalSince1970 * 1000
         let timeElapsed = max(1.0, currentTime - task.startTime)
 
